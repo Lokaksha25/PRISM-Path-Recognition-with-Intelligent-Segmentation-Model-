@@ -96,7 +96,11 @@ pip install -r requirements.txt
 
 ### 2. Dataset Setup
 
-Download and extract [nuScenes v1.0-mini](https://www.nuscenes.org/nuscenes#download) into the project root:
+Download the **nuScenes v1.0-mini** dataset from Google Drive and extract it into the project root:
+
+📁 **[Download Dataset from Google Drive](https://drive.google.com/drive/folders/1g5KgxG0p8-MmTiXkNtCpoYSIkdBQprEm)**
+
+After downloading, extract:
 ```bash
 tar -xzf v1.0-mini.tgz
 ```
