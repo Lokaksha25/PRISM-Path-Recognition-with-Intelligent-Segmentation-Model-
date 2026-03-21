@@ -38,7 +38,18 @@ python -c "import torch; print(f'CUDA: {torch.cuda.is_available()}, GPU: {torch.
 
 ### STEP 2 — Dataset Setup (~10 min)
 
-Copy the **nuScenes v1.0-mini** dataset into the project folder. You need these folders:
+**Download the dataset from Google Drive:**
+
+📁 **[Download nuScenes v1.0-mini from here](https://drive.google.com/drive/folders/1g5KgxG0p8-MmTiXkNtCpoYSIkdBQprEm)**
+
+1. Open the link above and download **all files** from the Drive folder
+2. Place the downloaded `.tgz` file inside the project folder
+3. Extract it:
+```bash
+tar -xzf v1.0-mini.tgz
+```
+
+After extraction, your project folder should look like this:
 ```
 Project Root/
 ├── v1.0-mini/        ← metadata JSONs (scene.json, sample.json, etc.)
@@ -48,11 +59,7 @@ Project Root/
 └── maps/             ← BEV map images
 ```
 
-**Option A:** Copy from Lokaksha's machine (he has it extracted already)  
-**Option B:** Extract from the `.tgz` file:
-```bash
-tar -xzf v1.0-mini.tgz
-```
+> ⚠️ The dataset is ~4 GB — make sure you have enough disk space.
 
 ---
 
