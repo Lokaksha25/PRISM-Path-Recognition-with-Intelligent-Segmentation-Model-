@@ -1,0 +1,61 @@
+# =============================================================================
+# PRISM — Path Recognition with Intelligent Segmentation Model
+# .gitignore
+# =============================================================================
+
+# ── Dataset (large files, not needed in repo) ──
+v1.0-mini.tgz
+v1.0-mini/
+samples/
+sweeps/
+maps/
+LICENSE
+
+# ── Generated masks (can be regenerated) ──
+masks/
+
+# ── Model outputs ──
+output/
+eval_output/
+inference_output/
+runs/
+*.pth
+*.onnx
+quantized_model.pth
+
+# ── Temp/analysis files ──
+explore_dataset.py
+dataset_analysis.txt
+model_test.txt
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+eggs/
+*.egg
+
+# ── IDE ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Environment ──
+.env
+venv/
+env/
+.conda/
+
+# ── Presentations ──
+*.pptx
+
+# ── System ──
+.v1.0-mini.txt
