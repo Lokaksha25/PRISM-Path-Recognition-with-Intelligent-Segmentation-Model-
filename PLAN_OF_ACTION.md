@@ -6,7 +6,7 @@
 
 ---
 
-## ✅ What's Already Done (by Lokaksha)
+## ✅ What's Already Done 
 
 - [x] Dataset analyzed (10 scenes, 404 images, 1600×900)
 - [x] Full codebase written (7 Python modules, 4,300 lines)
@@ -204,4 +204,3 @@ python inference.py --demo_video --weights output/best_model.pth --dataroot ./
 
 ---
 
-*Questions? Text Lokaksha — he built the entire codebase and knows every line. 💪*
