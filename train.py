@@ -30,7 +30,7 @@ from model import LiteSegNet, LiteSegTeacher, get_model_info
 from dataset import get_dataloaders
 from utils import (
     ComboLoss, BoundaryAwareLoss, DistillationLoss,
-    FocalTverskyLoss, BFABoundaryLoss, PRISMLoss,
+    PRISMLoss,
     compute_miou, count_parameters
 )
 
