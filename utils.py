@@ -306,14 +306,14 @@ class BFABoundaryLoss(nn.Module):
         dilation_kernel: Pixel width of the boundary band. Larger = thicker
                          boundary region that gets supervised. Default 7
                          works well for 256×448 resolution.
-        weight: Scalar weight applied to this loss term when used inside
-                PRISMLoss. Does not affect standalone use.
+        weight: (Deprecated) Kept for backward compatibility but ignored.
+                Overall boundary loss weighting should be applied externally
+                (e.g., in PRISMLoss).
     """
 
     def __init__(self, dilation_kernel=7, weight=1.0):
         super().__init__()
         self.dilation_kernel = dilation_kernel
-        self.weight = weight
         # Padding to keep spatial dimensions unchanged
         self.padding = dilation_kernel // 2
 
