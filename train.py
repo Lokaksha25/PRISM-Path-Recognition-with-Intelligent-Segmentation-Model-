@@ -30,6 +30,7 @@ from model import LiteSegNet, LiteSegTeacher, get_model_info
 from dataset import get_dataloaders
 from utils import (
     ComboLoss, BoundaryAwareLoss, DistillationLoss,
+    PRISMLoss,
     compute_miou, count_parameters
 )
 
@@ -65,9 +66,9 @@ def parse_args():
                         help='DataLoader workers (0 for Windows)')
     
     # Loss
-    parser.add_argument('--loss', type=str, default='combo',
-                        choices=['combo', 'boundary'],
-                        help='Loss function: combo or boundary-aware')
+    parser.add_argument('--loss', type=str, default='prism',
+                        choices=['combo', 'boundary', 'prism'],
+                        help='Loss function: combo, boundary-aware, or prism (recommended)')
     parser.add_argument('--loss_alpha', type=float, default=0.5,
                         help='BCE weight in combo loss (1-alpha for Dice)')
     
@@ -305,7 +306,13 @@ def main():
     )
     
     # Loss function
-    if args.loss == 'boundary':
+    if args.loss == 'prism':
+        criterion = PRISMLoss(
+            alpha=0.3, beta=0.7, gamma=0.75,
+            boundary_weight=0.4, dilation_kernel=7
+        ).to(device)
+        print("Loss: PRISMLoss (FocalTversky + BFA boundary) — recommended")
+    elif args.loss == 'boundary':
         criterion = BoundaryAwareLoss(alpha=args.loss_alpha).to(device)
         print("Loss: BoundaryAwareLoss")
     else:
