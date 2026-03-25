@@ -163,19 +163,26 @@ class DistillationLoss(nn.Module):
     Loss = alpha * task_loss(student, gt) + (1-alpha) * KD_loss(student, teacher)
     
     KD loss uses soft probabilities from the teacher to guide the student.
+    
+    Upgraded: task_loss now defaults to PRISMLoss for better class-imbalance
+    handling on small datasets. Pass task_loss=ComboLoss() to restore original
+    behaviour.
     """
     
-    def __init__(self, alpha=0.5, temperature=3.0):
+    def __init__(self, alpha=0.5, temperature=3.0, task_loss=None):
         """Initialize DistillationLoss.
         
         Args:
             alpha: Weight for ground-truth task loss vs distillation loss.
             temperature: Temperature for softening probabilities.
+            task_loss: Loss function for ground-truth supervision.
+                       Defaults to PRISMLoss (recommended for nuScenes).
+                       Pass ComboLoss() to restore original behaviour.
         """
         super().__init__()
         self.alpha = alpha
         self.temperature = temperature
-        self.task_loss = ComboLoss()
+        self.task_loss = task_loss if task_loss is not None else PRISMLoss()
     
     def forward(self, student_pred, teacher_pred, target):
         """Compute distillation loss.
@@ -202,6 +209,217 @@ class DistillationLoss(nn.Module):
         kd_loss = F.mse_loss(student_soft, teacher_soft) * (self.temperature ** 2)
         
         return self.alpha * task + (1.0 - self.alpha) * kd_loss
+
+
+# =============================================================================
+# NEW LOSS FUNCTIONS — optimised for nuScenes small-dataset training
+# =============================================================================
+
+class FocalTverskyLoss(nn.Module):
+    """Focal Tversky Loss — handles class imbalance better than BCE+Dice.
+
+    Tversky index generalises Dice by letting you penalise False Negatives
+    and False Positives asymmetrically via alpha/beta:
+
+        Tversky = TP / (TP + alpha*FP + beta*FN)
+
+    The Focal exponent gamma then down-weights easy examples so the
+    optimiser concentrates on hard, ambiguous pixels:
+
+        FocalTversky = (1 - Tversky)^gamma
+
+    Why this beats ComboLoss on nuScenes:
+        - nuScenes drivable labels are heavily imbalanced (road >> obstacles).
+        - Standard Dice weights FP and FN equally — wrong for safety-critical
+          segmentation where missing road (FN) is more costly than over-
+          predicting road (FP).
+        - The focal term automatically down-weights the easy, high-confidence
+          road-centre pixels and forces the model to focus on hard boundary
+          pixels — exactly where mIoU is won or lost.
+
+    Recommended defaults:
+        alpha=0.3, beta=0.7  — penalise FN more (conservative: prefer
+                               predicting road over missing road)
+        gamma=0.75           — mild focal effect; raise to 1.5 if the model
+                               is still ignoring hard examples after 10 epochs
+
+    Args:
+        alpha: FP weight in Tversky denominator.  alpha + beta should = 1.
+        beta:  FN weight in Tversky denominator.
+        gamma: Focal exponent. 0 = standard Tversky, >0 = focal weighting.
+        smooth: Smoothing constant to prevent division by zero.
+    """
+
+    def __init__(self, alpha=0.3, beta=0.7, gamma=0.75, smooth=1.0):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.smooth = smooth
+
+    def forward(self, pred, target):
+        """Compute Focal Tversky loss.
+
+        Args:
+            pred:   (N, 1, H, W) sigmoid probabilities in [0, 1].
+            target: (N, 1, H, W) float binary ground truth {0, 1}.
+
+        Returns:
+            Scalar Focal Tversky loss.
+        """
+        pred_flat   = pred.contiguous().view(-1)
+        target_flat = target.contiguous().view(-1)
+
+        tp = (pred_flat * target_flat).sum()
+        fp = (pred_flat * (1.0 - target_flat)).sum()
+        fn = ((1.0 - pred_flat) * target_flat).sum()
+
+        tversky = (tp + self.smooth) / (
+            tp + self.alpha * fp + self.beta * fn + self.smooth
+        )
+
+        focal_tversky = (1.0 - tversky) ** self.gamma
+        return focal_tversky
+
+
+class BFABoundaryLoss(nn.Module):
+    """Boundary Feature Analysis loss — sharpens drivable space edges.
+
+    Inspired by BFANet (CVPR 2025). Computes a boundary pseudo-label by
+    comparing a dilated and an eroded version of the GT mask, then applies
+    a focused BCE loss only on those boundary pixels.
+
+    Why this matters:
+        - Most segmentation errors on nuScenes happen at the road edge
+          (where road meets kerb, grass, or puddle).
+        - Standard Dice/BCE treat all pixels equally — boundary pixels are a
+          tiny fraction so their gradient signal is drowned out.
+        - This loss isolates boundary pixels and applies full BCE loss on
+          just those pixels, forcing the model to get edges right.
+
+    How the pseudo-label is built:
+        dilated_mask  = max_pool(GT, kernel)   — expands the road region
+        eroded_mask   = -max_pool(-GT, kernel) — shrinks the road region
+        boundary      = dilated - eroded       — only the edge band
+
+    Args:
+        dilation_kernel: Pixel width of the boundary band. Larger = thicker
+                         boundary region that gets supervised. Default 7
+                         works well for 256×448 resolution.
+        weight: Scalar weight applied to this loss term when used inside
+                PRISMLoss. Does not affect standalone use.
+    """
+
+    def __init__(self, dilation_kernel=7, weight=1.0):
+        super().__init__()
+        self.dilation_kernel = dilation_kernel
+        self.weight = weight
+        # Padding to keep spatial dimensions unchanged
+        self.padding = dilation_kernel // 2
+
+    def _boundary_pseudo_label(self, target):
+        """Compute boundary pseudo-label from GT mask.
+
+        Args:
+            target: (N, 1, H, W) float binary GT.
+
+        Returns:
+            (N, 1, H, W) float boundary mask — 1 at boundary, 0 elsewhere.
+        """
+        k = self.dilation_kernel
+        p = self.padding
+        dilated = F.max_pool2d(target, k, stride=1, padding=p)
+        eroded  = -F.max_pool2d(-target, k, stride=1, padding=p)
+        boundary = (dilated - eroded).clamp(0.0, 1.0)
+        return boundary
+
+    def forward(self, pred, target):
+        """Compute BFA boundary loss.
+
+        Args:
+            pred:   (N, 1, H, W) sigmoid probabilities.
+            target: (N, 1, H, W) float binary ground truth.
+
+        Returns:
+            Scalar boundary BCE loss. Returns 0 if no boundary pixels exist.
+        """
+        boundary = self._boundary_pseudo_label(target)
+
+        # Only supervise pixels inside the boundary band
+        n_boundary = boundary.sum()
+        if n_boundary < 1.0:
+            return pred.sum() * 0.0  # Zero loss, but keeps gradient graph
+
+        boundary_pred   = pred[boundary > 0.5]
+        boundary_target = target[boundary > 0.5]
+
+        return F.binary_cross_entropy(boundary_pred, boundary_target)
+
+
+class PRISMLoss(nn.Module):
+    """Combined loss for PRISM — recommended replacement for ComboLoss.
+
+    PRISMLoss = FocalTversky  +  boundary_weight * BFABoundary
+
+    Why this combination works on small datasets:
+        - FocalTversky handles the global class imbalance and forces the
+          model to focus on hard pixels rather than easy road-centre pixels.
+        - BFABoundary applies targeted supervision at edge pixels — the
+          exact locations where the mIoU score is determined.
+        - Together they cover two independent failure modes of ComboLoss:
+          ignoring rare classes and blurring boundaries.
+
+    Drop-in replacement for ComboLoss and BoundaryAwareLoss in train.py:
+
+        # Before
+        criterion = ComboLoss(alpha=0.5)
+        # After
+        criterion = PRISMLoss()
+
+    The train.py --loss argument is extended to accept 'prism':
+
+        python train.py --loss prism
+
+    Args:
+        alpha:          FP weight in Tversky (see FocalTverskyLoss).
+        beta:           FN weight in Tversky.
+        gamma:          Focal exponent.
+        smooth:         Tversky smoothing constant.
+        boundary_weight: Scalar weight for the BFA boundary term.
+                         0.0 = pure FocalTversky (no boundary supervision).
+                         0.4 = recommended starting point.
+                         Raise to 0.6 if boundary mIoU is still poor after
+                         20 epochs.
+        dilation_kernel: Boundary band width (pixels) for BFABoundaryLoss.
+    """
+
+    def __init__(
+        self,
+        alpha=0.3,
+        beta=0.7,
+        gamma=0.75,
+        smooth=1.0,
+        boundary_weight=0.4,
+        dilation_kernel=7,
+    ):
+        super().__init__()
+        self.focal_tversky  = FocalTverskyLoss(alpha, beta, gamma, smooth)
+        self.boundary       = BFABoundaryLoss(dilation_kernel)
+        self.boundary_weight = boundary_weight
+
+    def forward(self, pred, target):
+        """Compute PRISMLoss.
+
+        Args:
+            pred:   (N, 1, H, W) sigmoid probabilities.
+            target: (N, 1, H, W) float binary ground truth.
+
+        Returns:
+            Scalar combined loss.
+        """
+        ft_loss  = self.focal_tversky(pred, target)
+        bfa_loss = self.boundary(pred, target)
+        return ft_loss + self.boundary_weight * bfa_loss
 
 
 # =============================================================================
