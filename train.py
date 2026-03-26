@@ -2,11 +2,13 @@
 train.py — Training pipeline for LiteSeg drivable space segmentation.
 
 Features:
-- AdamW optimizer with CosineAnnealingLR schedule
-- ComboLoss (BCE + Dice) with optional boundary-aware weighting
-- TensorBoard logging of loss, mIoU, learning rate
+- PRISMLossV2 (Focal + Tversky + Boundary) as default loss
+- OneCycleLR with warmup for from-scratch convergence
+- Detailed metric tracking (mIoU, Precision, Recall, FPR)
+- TensorBoard logging of all metrics
 - Best checkpoint saving based on validation mIoU
 - Knowledge distillation support (teacher → student)
+- Gradient accumulation for effective larger batches
 - tqdm progress bars
 - Full argparse configurability
 
@@ -29,8 +31,8 @@ import numpy as np
 from model import LiteSegNet, LiteSegTeacher, get_model_info
 from dataset import get_dataloaders
 from utils import (
-    ComboLoss, BoundaryAwareLoss, DistillationLoss,
-    compute_miou, count_parameters
+    PRISMLossV2, ComboLoss, BoundaryAwareLoss, DistillationLoss,
+    compute_miou, compute_detailed_metrics, count_parameters
 )
 
 
@@ -57,19 +59,28 @@ def parse_args():
                         help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=16,
                         help='Training batch size')
-    parser.add_argument('--lr', type=float, default=1e-3,
-                        help='Initial learning rate')
+    parser.add_argument('--lr', type=float, default=6e-3,
+                        help='Peak learning rate (for OneCycleLR)')
     parser.add_argument('--weight_decay', type=float, default=1e-4,
                         help='Weight decay for AdamW')
     parser.add_argument('--num_workers', type=int, default=0,
                         help='DataLoader workers (0 for Windows)')
+    parser.add_argument('--grad_accum', type=int, default=1,
+                        help='Gradient accumulation steps (effective batch = batch_size * grad_accum)')
     
     # Loss
-    parser.add_argument('--loss', type=str, default='combo',
-                        choices=['combo', 'boundary'],
-                        help='Loss function: combo or boundary-aware')
+    parser.add_argument('--loss', type=str, default='prism',
+                        choices=['prism', 'combo', 'boundary'],
+                        help='Loss function: prism (recommended), combo, or boundary')
     parser.add_argument('--loss_alpha', type=float, default=0.5,
                         help='BCE weight in combo loss (1-alpha for Dice)')
+    
+    # LR Schedule
+    parser.add_argument('--scheduler', type=str, default='onecycle',
+                        choices=['onecycle', 'cosine'],
+                        help='LR scheduler: onecycle (recommended) or cosine')
+    parser.add_argument('--warmup_pct', type=float, default=0.3,
+                        help='Fraction of training for warmup (OneCycleLR)')
     
     # Knowledge distillation
     parser.add_argument('--distill', action='store_true',
@@ -100,17 +111,19 @@ def parse_args():
     return parser.parse_args()
 
 
-def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch,
-                    teacher_model=None, distill_loss_fn=None):
+def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device,
+                    epoch, grad_accum=1, teacher_model=None, distill_loss_fn=None):
     """Train the model for one epoch.
     
     Args:
-        model: The segmentation model.
+        model: The segmentation model (returns raw logits).
         dataloader: Training DataLoader.
-        criterion: Loss function.
+        criterion: Loss function (operates on logits).
         optimizer: Optimizer.
+        scheduler: Learning rate scheduler (stepped per batch for OneCycleLR).
         device: Device to train on.
         epoch: Current epoch number.
+        grad_accum: Gradient accumulation steps.
         teacher_model: Optional teacher model for distillation.
         distill_loss_fn: Optional distillation loss function.
         
@@ -121,67 +134,88 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch,
     
     running_loss = 0.0
     running_iou = 0.0
+    running_precision = 0.0
+    running_recall = 0.0
+    running_fpr = 0.0
     n_batches = 0
     
     pbar = tqdm(dataloader, desc=f'Epoch {epoch+1} [Train]', leave=False)
     
-    for images, masks in pbar:
+    optimizer.zero_grad()
+    
+    for batch_idx, (images, masks) in enumerate(pbar):
         images = images.to(device)
         masks = masks.to(device)
         
-        # Forward pass
-        predictions = model(images)
+        # Forward pass — model returns raw logits
+        logits = model(images)
         
-        # Compute loss
+        # Compute loss on logits
         if teacher_model is not None and distill_loss_fn is not None:
             teacher_model.eval()
             with torch.no_grad():
-                teacher_pred = teacher_model(images)
-            loss = distill_loss_fn(predictions, teacher_pred, masks)
+                teacher_logits = teacher_model(images)
+            loss = distill_loss_fn(logits, teacher_logits, masks)
         else:
-            loss = criterion(predictions, masks)
+            loss = criterion(logits, masks)
+        
+        # Scale loss for gradient accumulation
+        loss = loss / grad_accum
         
         # Backward pass
-        optimizer.zero_grad()
         loss.backward()
         
-        # Gradient clipping for stability
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        # Step optimizer every grad_accum batches
+        if (batch_idx + 1) % grad_accum == 0 or (batch_idx + 1) == len(dataloader):
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+            
+            # Step OneCycleLR per batch (not per epoch)
+            if scheduler is not None and hasattr(scheduler, '_step_count'):
+                scheduler.step()
         
-        optimizer.step()
-        
-        # Metrics
+        # Metrics (need sigmoid for probability-based metrics)
         with torch.no_grad():
-            miou, iou_drv, iou_non = compute_miou(predictions, masks)
+            probs = torch.sigmoid(logits)
+            metrics = compute_detailed_metrics(probs, masks)
         
-        running_loss += loss.item()
-        running_iou += miou
+        running_loss += loss.item() * grad_accum  # Undo scaling for logging
+        running_iou += metrics['miou']
+        running_precision += metrics['precision']
+        running_recall += metrics['recall']
+        running_fpr += metrics['fpr']
         n_batches += 1
         
         pbar.set_postfix({
-            'loss': f'{loss.item():.4f}',
-            'mIoU': f'{miou:.4f}'
+            'loss': f'{loss.item() * grad_accum:.4f}',
+            'mIoU': f'{metrics["miou"]:.4f}',
+            'FPR': f'{metrics["fpr"]:.4f}',
         })
     
-    avg_loss = running_loss / max(n_batches, 1)
-    avg_iou = running_iou / max(n_batches, 1)
-    
-    return {'loss': avg_loss, 'miou': avg_iou}
+    n = max(n_batches, 1)
+    return {
+        'loss': running_loss / n,
+        'miou': running_iou / n,
+        'precision': running_precision / n,
+        'recall': running_recall / n,
+        'fpr': running_fpr / n,
+    }
 
 
 @torch.no_grad()
 def validate(model, dataloader, criterion, device, epoch):
-    """Validate the model.
+    """Validate the model with detailed metrics.
     
     Args:
-        model: The segmentation model.
+        model: The segmentation model (returns raw logits).
         dataloader: Validation DataLoader.
-        criterion: Loss function.
+        criterion: Loss function (operates on logits).
         device: Device to run on.
         epoch: Current epoch number.
         
     Returns:
-        Dict with validation metrics.
+        Dict with comprehensive validation metrics.
     """
     model.eval()
     
@@ -189,6 +223,10 @@ def validate(model, dataloader, criterion, device, epoch):
     running_miou = 0.0
     running_iou_drv = 0.0
     running_iou_non = 0.0
+    running_precision = 0.0
+    running_recall = 0.0
+    running_fpr = 0.0
+    running_f1 = 0.0
     n_batches = 0
     
     pbar = tqdm(dataloader, desc=f'Epoch {epoch+1} [Val]  ', leave=False)
@@ -197,20 +235,28 @@ def validate(model, dataloader, criterion, device, epoch):
         images = images.to(device)
         masks = masks.to(device)
         
-        predictions = model(images)
-        loss = criterion(predictions, masks)
+        logits = model(images)
+        loss = criterion(logits, masks)
         
-        miou, iou_drv, iou_non = compute_miou(predictions, masks)
+        # Compute detailed metrics on probabilities
+        probs = torch.sigmoid(logits)
+        metrics = compute_detailed_metrics(probs, masks)
         
         running_loss += loss.item()
-        running_miou += miou
-        running_iou_drv += iou_drv
-        running_iou_non += iou_non
+        running_miou += metrics['miou']
+        running_iou_drv += metrics['iou_drivable']
+        running_iou_non += metrics['iou_non_drivable']
+        running_precision += metrics['precision']
+        running_recall += metrics['recall']
+        running_fpr += metrics['fpr']
+        running_f1 += metrics['f1']
         n_batches += 1
         
         pbar.set_postfix({
             'loss': f'{loss.item():.4f}',
-            'mIoU': f'{miou:.4f}'
+            'mIoU': f'{metrics["miou"]:.4f}',
+            'Prec': f'{metrics["precision"]:.4f}',
+            'FPR': f'{metrics["fpr"]:.4f}',
         })
     
     n = max(n_batches, 1)
@@ -219,11 +265,17 @@ def validate(model, dataloader, criterion, device, epoch):
         'miou': running_miou / n,
         'iou_drivable': running_iou_drv / n,
         'iou_non_drivable': running_iou_non / n,
+        'precision': running_precision / n,
+        'recall': running_recall / n,
+        'fpr': running_fpr / n,
+        'f1': running_f1 / n,
     }
 
 
 def measure_fps(model, device, input_size=(1, 3, 256, 448), n_runs=100):
     """Measure inference FPS.
+    
+    Uses model.predict() (with sigmoid) for realistic inference timing.
     
     Args:
         model: The segmentation model.
@@ -240,7 +292,7 @@ def measure_fps(model, device, input_size=(1, 3, 256, 448), n_runs=100):
     # Warmup
     for _ in range(10):
         with torch.no_grad():
-            _ = model(dummy)
+            _ = model.predict(dummy)
     
     # Benchmark
     if device.type == 'cuda':
@@ -249,7 +301,7 @@ def measure_fps(model, device, input_size=(1, 3, 256, 448), n_runs=100):
     start = time.perf_counter()
     for _ in range(n_runs):
         with torch.no_grad():
-            _ = model(dummy)
+            _ = model.predict(dummy)
     
     if device.type == 'cuda':
         torch.cuda.synchronize()
@@ -271,7 +323,7 @@ def main():
     # Device setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"\n{'='*60}")
-    print(f"LiteSeg Training")
+    print(f"LiteSeg Training (V2 — FP-aware)")
     print(f"{'='*60}")
     print(f"Device: {device}")
     if device.type == 'cuda':
@@ -293,6 +345,7 @@ def main():
     n_params = count_parameters(model)
     print(f"Model: {model_name}")
     print(f"Parameters: {n_params:,} ({n_params/1e6:.2f}M)")
+    print(f"Under 3M: {'✓' if n_params < 3_000_000 else '✗'}")
     
     # Create data loaders
     train_loader, val_loader, data_stats = get_dataloaders(
@@ -304,13 +357,16 @@ def main():
         num_workers=args.num_workers,
     )
     
-    # Loss function
-    if args.loss == 'boundary':
+    # Loss function — default is PRISMLossV2
+    if args.loss == 'prism':
+        criterion = PRISMLossV2().to(device)
+        print("Loss: PRISMLossV2 (Focal + Tversky + Boundary)")
+    elif args.loss == 'boundary':
         criterion = BoundaryAwareLoss(alpha=args.loss_alpha).to(device)
-        print("Loss: BoundaryAwareLoss")
+        print("Loss: BoundaryAwareLoss (legacy)")
     else:
         criterion = ComboLoss(alpha=args.loss_alpha).to(device)
-        print("Loss: ComboLoss (BCE + Dice)")
+        print("Loss: ComboLoss (legacy)")
     
     # Knowledge distillation setup
     teacher_model = None
@@ -326,7 +382,7 @@ def main():
             temperature=args.distill_temp
         ).to(device)
     
-    # Optimizer
+    # Optimizer — AdamW
     optimizer = optim.AdamW(
         model.parameters(),
         lr=args.lr,
@@ -334,9 +390,24 @@ def main():
     )
     
     # Learning rate scheduler
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=1e-6
-    )
+    if args.scheduler == 'onecycle':
+        total_steps = len(train_loader) * args.epochs
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=args.lr,
+            total_steps=total_steps,
+            pct_start=args.warmup_pct,
+            anneal_strategy='cos',
+            final_div_factor=1000,
+        )
+        step_scheduler_per_epoch = False
+        print(f"Scheduler: OneCycleLR (max_lr={args.lr}, warmup={args.warmup_pct*100:.0f}%)")
+    else:
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs, eta_min=1e-6
+        )
+        step_scheduler_per_epoch = True
+        print(f"Scheduler: CosineAnnealingLR (T_max={args.epochs})")
     
     # Resume from checkpoint
     start_epoch = 0
@@ -346,7 +417,8 @@ def main():
         ckpt = torch.load(args.resume, map_location=device)
         model.load_state_dict(ckpt['model_state_dict'])
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+        if 'scheduler_state_dict' in ckpt:
+            scheduler.load_state_dict(ckpt['scheduler_state_dict'])
         start_epoch = ckpt['epoch'] + 1
         best_miou = ckpt.get('best_miou', 0.0)
     
@@ -363,9 +435,15 @@ def main():
         json.dump(config, f, indent=2)
     
     # Training history
-    history = {'train_loss': [], 'val_loss': [], 'train_miou': [], 'val_miou': [], 'lr': []}
+    history = {
+        'train_loss': [], 'val_loss': [],
+        'train_miou': [], 'val_miou': [],
+        'val_precision': [], 'val_recall': [], 'val_fpr': [], 'val_f1': [],
+        'lr': []
+    }
     
     print(f"\nStarting training for {args.epochs} epochs...")
+    print(f"Effective batch size: {args.batch_size * args.grad_accum}")
     print(f"{'='*60}\n")
     
     # =========================================================================
@@ -375,32 +453,45 @@ def main():
         epoch_start = time.time()
         current_lr = optimizer.param_groups[0]['lr']
         
-        # Train
+        # Train (scheduler stepped per batch inside if OneCycleLR)
         train_metrics = train_one_epoch(
-            model, train_loader, criterion, optimizer, device, epoch,
+            model, train_loader, criterion, optimizer,
+            scheduler if not step_scheduler_per_epoch else None,
+            device, epoch, grad_accum=args.grad_accum,
             teacher_model=teacher_model, distill_loss_fn=distill_loss_fn
         )
         
         # Validate
         val_metrics = validate(model, val_loader, criterion, device, epoch)
         
-        # Step scheduler
-        scheduler.step()
+        # Step scheduler per epoch (CosineAnnealing only)
+        if step_scheduler_per_epoch:
+            scheduler.step()
         
         # Record history
         history['train_loss'].append(train_metrics['loss'])
         history['val_loss'].append(val_metrics['loss'])
         history['train_miou'].append(train_metrics['miou'])
         history['val_miou'].append(val_metrics['miou'])
+        history['val_precision'].append(val_metrics['precision'])
+        history['val_recall'].append(val_metrics['recall'])
+        history['val_fpr'].append(val_metrics['fpr'])
+        history['val_f1'].append(val_metrics['f1'])
         history['lr'].append(current_lr)
         
-        # TensorBoard logging
+        # TensorBoard logging — comprehensive
         writer.add_scalar('Loss/train', train_metrics['loss'], epoch)
         writer.add_scalar('Loss/val', val_metrics['loss'], epoch)
         writer.add_scalar('mIoU/train', train_metrics['miou'], epoch)
         writer.add_scalar('mIoU/val', val_metrics['miou'], epoch)
         writer.add_scalar('IoU/drivable', val_metrics['iou_drivable'], epoch)
         writer.add_scalar('IoU/non_drivable', val_metrics['iou_non_drivable'], epoch)
+        # FALSE POSITIVE DETECTION METRICS
+        writer.add_scalar('FP_Detection/precision', val_metrics['precision'], epoch)
+        writer.add_scalar('FP_Detection/recall', val_metrics['recall'], epoch)
+        writer.add_scalar('FP_Detection/fpr', val_metrics['fpr'], epoch)
+        writer.add_scalar('FP_Detection/f1', val_metrics['f1'], epoch)
+        writer.add_scalar('FP_Detection/train_fpr', train_metrics['fpr'], epoch)
         writer.add_scalar('LR', current_lr, epoch)
         
         # Save best checkpoint
@@ -432,24 +523,28 @@ def main():
         
         epoch_time = time.time() - epoch_start
         
-        # Print epoch summary
+        # Print epoch summary with FPR (the key diagnostic metric)
         best_marker = ' ★ BEST' if is_best else ''
         print(f"Epoch {epoch+1:3d}/{args.epochs} | "
-              f"Train Loss: {train_metrics['loss']:.4f} | "
-              f"Val Loss: {val_metrics['loss']:.4f} | "
-              f"Train mIoU: {train_metrics['miou']:.4f} | "
-              f"Val mIoU: {val_metrics['miou']:.4f} | "
-              f"IoU(drv): {val_metrics['iou_drivable']:.4f} | "
+              f"Loss: {train_metrics['loss']:.4f}/{val_metrics['loss']:.4f} | "
+              f"mIoU: {train_metrics['miou']:.4f}/{val_metrics['miou']:.4f} | "
+              f"Prec: {val_metrics['precision']:.3f} | "
+              f"FPR: {val_metrics['fpr']:.3f} | "
+              f"F1: {val_metrics['f1']:.3f} | "
               f"LR: {current_lr:.6f} | "
-              f"Time: {epoch_time:.1f}s{best_marker}")
+              f"{epoch_time:.1f}s{best_marker}")
         
         # Detailed report every 10 epochs
         if (epoch + 1) % 10 == 0:
             print(f"\n{'─'*60}")
             print(f"  Checkpoint Report @ Epoch {epoch+1}")
             print(f"  Best Val mIoU: {best_miou:.4f}")
-            print(f"  Val IoU (drivable): {val_metrics['iou_drivable']:.4f}")
+            print(f"  Val IoU (drivable):     {val_metrics['iou_drivable']:.4f}")
             print(f"  Val IoU (non-drivable): {val_metrics['iou_non_drivable']:.4f}")
+            print(f"  Val Precision:  {val_metrics['precision']:.4f}")
+            print(f"  Val Recall:     {val_metrics['recall']:.4f}")
+            print(f"  Val FPR:        {val_metrics['fpr']:.4f}  (↓ lower is better)")
+            print(f"  Val F1:         {val_metrics['f1']:.4f}")
             
             # Measure FPS
             fps = measure_fps(model, device)
@@ -485,7 +580,7 @@ def main():
 
 
 def generate_training_curves(history, output_dir):
-    """Generate and save training curve plots.
+    """Generate and save training curve plots including FPR tracking.
     
     Args:
         history: Dict with training history lists.
@@ -497,32 +592,43 @@ def generate_training_curves(history, output_dir):
     
     epochs = range(1, len(history['train_loss']) + 1)
     
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
     
     # Loss curves
-    axes[0].plot(epochs, history['train_loss'], 'b-', label='Train Loss', linewidth=2)
-    axes[0].plot(epochs, history['val_loss'], 'r-', label='Val Loss', linewidth=2)
-    axes[0].set_xlabel('Epoch')
-    axes[0].set_ylabel('Loss')
-    axes[0].set_title('Training & Validation Loss')
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3)
+    axes[0, 0].plot(epochs, history['train_loss'], 'b-', label='Train Loss', linewidth=2)
+    axes[0, 0].plot(epochs, history['val_loss'], 'r-', label='Val Loss', linewidth=2)
+    axes[0, 0].set_xlabel('Epoch')
+    axes[0, 0].set_ylabel('Loss')
+    axes[0, 0].set_title('Training & Validation Loss')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
     
     # mIoU curves
-    axes[1].plot(epochs, history['train_miou'], 'b-', label='Train mIoU', linewidth=2)
-    axes[1].plot(epochs, history['val_miou'], 'r-', label='Val mIoU', linewidth=2)
-    axes[1].set_xlabel('Epoch')
-    axes[1].set_ylabel('mIoU')
-    axes[1].set_title('Training & Validation mIoU')
-    axes[1].legend()
-    axes[1].grid(True, alpha=0.3)
+    axes[0, 1].plot(epochs, history['train_miou'], 'b-', label='Train mIoU', linewidth=2)
+    axes[0, 1].plot(epochs, history['val_miou'], 'r-', label='Val mIoU', linewidth=2)
+    axes[0, 1].set_xlabel('Epoch')
+    axes[0, 1].set_ylabel('mIoU')
+    axes[0, 1].set_title('Training & Validation mIoU')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+    
+    # FALSE POSITIVE RATE — the key diagnostic
+    axes[1, 0].plot(epochs, history['val_fpr'], 'r-', label='Val FPR', linewidth=2)
+    axes[1, 0].plot(epochs, history['val_precision'], 'g-', label='Val Precision', linewidth=2)
+    axes[1, 0].plot(epochs, history['val_recall'], 'b-', label='Val Recall', linewidth=2)
+    axes[1, 0].plot(epochs, history['val_f1'], 'm--', label='Val F1', linewidth=1.5)
+    axes[1, 0].set_xlabel('Epoch')
+    axes[1, 0].set_ylabel('Score')
+    axes[1, 0].set_title('FP Detection Metrics (FPR ↓ = better)')
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, alpha=0.3)
     
     # Learning rate
-    axes[2].plot(epochs, history['lr'], 'g-', linewidth=2)
-    axes[2].set_xlabel('Epoch')
-    axes[2].set_ylabel('Learning Rate')
-    axes[2].set_title('Learning Rate Schedule')
-    axes[2].grid(True, alpha=0.3)
+    axes[1, 1].plot(epochs, history['lr'], 'g-', linewidth=2)
+    axes[1, 1].set_xlabel('Epoch')
+    axes[1, 1].set_ylabel('Learning Rate')
+    axes[1, 1].set_title('Learning Rate Schedule')
+    axes[1, 1].grid(True, alpha=0.3)
     
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'training_curves.png'), dpi=150, bbox_inches='tight')
