@@ -3,8 +3,10 @@ model.py — LiteSeg: Lightweight Segmentation Network for Drivable Space.
 
 Custom architecture built entirely from scratch:
 - Encoder: MobileNetV2-style inverted residual blocks (depthwise separable convolutions)
+- CoordConv: Injects (x, y) positional channels for spatial awareness
+- Squeeze-Excite attention in decoder for channel recalibration
 - Decoder: Lightweight ASPP (dilation rates 6, 12, 18) + U-Net skip connections
-- Output: Binary segmentation head (sigmoid → threshold 0.5)
+- Output: Raw logits (sigmoid applied externally for numerical stability)
 
 Target: <3M parameters, >30 FPS on CPU, >100 FPS on GPU.
 """
@@ -12,6 +14,113 @@ Target: <3M parameters, >30 FPS on CPU, >100 FPS on GPU.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+# =============================================================================
+# SPATIAL AWARENESS: CoordConv
+# =============================================================================
+
+class AddCoords(nn.Module):
+    """Concatenate normalized (x, y) coordinate channels to input tensor.
+    
+    Critical for training from scratch: gives the network absolute position
+    awareness so it can learn spatial priors like 'sky is at top, road at bottom'
+    without pretrained ImageNet features.
+    
+    Adds 2 channels: normalized x ∈ [-1, 1] and y ∈ [-1, 1].
+    """
+    
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, x):
+        """Add coordinate channels to input.
+        
+        Args:
+            x: Input tensor (N, C, H, W).
+            
+        Returns:
+            Tensor (N, C+2, H, W) with x and y coordinate channels appended.
+        """
+        B, _, H, W = x.shape
+        
+        # Create normalized coordinate grids [-1, 1]
+        y_coords = torch.linspace(-1, 1, H, device=x.device, dtype=x.dtype)
+        x_coords = torch.linspace(-1, 1, W, device=x.device, dtype=x.dtype)
+        
+        # Expand to (1, 1, H, W) and (1, 1, H, W)
+        y_grid = y_coords.view(1, 1, H, 1).expand(B, 1, H, W)
+        x_grid = x_coords.view(1, 1, 1, W).expand(B, 1, H, W)
+        
+        return torch.cat([x, x_grid, y_grid], dim=1)
+
+
+class CoordConv(nn.Module):
+    """CoordConv = AddCoords + Standard Conv2d.
+    
+    Liu et al., 2018 — "An Intriguing Failing of Convolutional Neural Networks
+    and the CoordConv Solution". Particularly effective for:
+    - Coordinate transforms (which we need: pixel position → class label)
+    - Training from scratch (no pretrained spatial priors)
+    """
+    
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1,
+                 padding=1, bias=False):
+        super().__init__()
+        self.add_coords = AddCoords()
+        self.conv = nn.Conv2d(
+            in_channels + 2, out_channels, kernel_size,
+            stride=stride, padding=padding, bias=bias
+        )
+    
+    def forward(self, x):
+        x = self.add_coords(x)
+        return self.conv(x)
+
+
+# =============================================================================
+# CHANNEL ATTENTION: Squeeze-and-Excite
+# =============================================================================
+
+class SqueezeExcite(nn.Module):
+    """Squeeze-and-Excitation channel attention block.
+    
+    Learns to recalibrate channel-wise feature responses.
+    In decoder: suppresses irrelevant skip-connection channels
+    (e.g., building texture features when predicting road).
+    
+    Only adds ~2*C parameters per block — negligible cost.
+    """
+    
+    def __init__(self, channels, reduction=4):
+        """Initialize SE block.
+        
+        Args:
+            channels: Number of input/output channels.
+            reduction: Channel reduction ratio for bottleneck.
+        """
+        super().__init__()
+        mid = max(channels // reduction, 8)
+        self.fc = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(channels, mid),
+            nn.ReLU(inplace=True),
+            nn.Linear(mid, channels),
+            nn.Sigmoid(),
+        )
+    
+    def forward(self, x):
+        """Apply channel attention.
+        
+        Args:
+            x: Input tensor (N, C, H, W).
+            
+        Returns:
+            Channel-recalibrated tensor (N, C, H, W).
+        """
+        scale = self.fc(x).view(x.size(0), x.size(1), 1, 1)
+        return x * scale
 
 
 # =============================================================================
@@ -116,6 +225,8 @@ class MobileNetV2Encoder(nn.Module):
     Progressively downsamples the input through inverted residual blocks,
     producing feature maps at 1/2, 1/4, 1/8, and 1/16 resolution.
     
+    Uses CoordConv at the stem to inject spatial position awareness.
+    
     Channel widths are reduced compared to standard MobileNetV2
     to keep total model under 3M parameters.
     
@@ -130,8 +241,11 @@ class MobileNetV2Encoder(nn.Module):
         """
         super().__init__()
         
-        # Initial convolution: 3 → 32 channels, stride 2 (1/2 resolution)
-        self.stem = ConvBNReLU(in_channels, 32, kernel_size=3, stride=2, padding=1)
+        # CoordConv stem: RGB + (x, y) → 32 channels, stride 2 (1/2 resolution)
+        # CoordConv adds 2 coordinate channels, so input is in_channels + 2
+        self.coord_conv = CoordConv(in_channels, 32, kernel_size=3, stride=2, padding=1)
+        self.stem_bn = nn.BatchNorm2d(32)
+        self.stem_relu = nn.ReLU6(inplace=True)
         
         # Stage 1: 32 → 16, stride 1 (still 1/2 resolution)
         self.stage1 = InvertedResidualBlock(32, 16, stride=1, expand_ratio=1)
@@ -182,7 +296,8 @@ class MobileNetV2Encoder(nn.Module):
             - skip_8x: Features at 1/8 resolution (32 channels)
             - features_16x: Features at 1/16 resolution (160 channels)
         """
-        x = self.stem(x)      # 1/2
+        # CoordConv stem (position-aware)
+        x = self.stem_relu(self.stem_bn(self.coord_conv(x)))  # 1/2
         x = self.stage1(x)    # 1/2
         
         x = self.stage2(x)    # 1/4
@@ -284,14 +399,15 @@ class LightweightASPP(nn.Module):
 
 
 # =============================================================================
-# DECODER (U-Net style)
+# DECODER (U-Net style with SE attention)
 # =============================================================================
 
 class DecoderBlock(nn.Module):
-    """Single decoder block: upsample → concatenate skip → refine.
+    """Single decoder block: upsample → concatenate skip → refine → SE attend.
     
     Uses bilinear upsampling (not transposed convolution) for efficiency
-    and to avoid checkerboard artifacts.
+    and to avoid checkerboard artifacts. SE attention recalibrates channels
+    after skip concatenation to suppress irrelevant encoder features.
     """
     
     def __init__(self, in_channels, skip_channels, out_channels):
@@ -307,27 +423,32 @@ class DecoderBlock(nn.Module):
             ConvBNReLU(in_channels + skip_channels, out_channels, kernel_size=3, padding=1),
             ConvBNReLU(out_channels, out_channels, kernel_size=3, padding=1),
         )
+        # Channel attention after refinement
+        self.se = SqueezeExcite(out_channels, reduction=4)
     
     def forward(self, x, skip):
-        """Forward pass with skip connection.
+        """Forward pass with skip connection and SE attention.
         
         Args:
             x: Input features from previous level.
             skip: Skip connection features from encoder.
             
         Returns:
-            Refined features at 2× resolution.
+            Refined, attention-recalibrated features at 2× resolution.
         """
         # Upsample to match skip connection size
         x = F.interpolate(x, size=skip.shape[2:], mode='bilinear', align_corners=True)
         # Concatenate with skip
         x = torch.cat([x, skip], dim=1)
         # Refine
-        return self.refine(x)
+        x = self.refine(x)
+        # Channel attention
+        x = self.se(x)
+        return x
 
 
 class UNetDecoder(nn.Module):
-    """U-Net style decoder with bilinear upsampling and skip connections.
+    """U-Net style decoder with bilinear upsampling, skip connections, and SE attention.
     
     Takes ASPP output (1/16 resolution) and progressively upsamples
     using skip connections from the encoder at 1/8 and 1/4 resolution.
@@ -373,9 +494,14 @@ class LiteSegNet(nn.Module):
     """LiteSeg: Complete lightweight segmentation network.
     
     Architecture:
-        Input → MobileNetV2 Encoder → ASPP → U-Net Decoder → Segmentation Head
+        Input → CoordConv Stem → MobileNetV2 Encoder → ASPP → 
+        U-Net Decoder (with SE attention) → Segmentation Head
         
-    Produces binary drivable/non-drivable segmentation mask.
+    Produces binary drivable/non-drivable segmentation.
+    
+    IMPORTANT: forward() returns RAW LOGITS (not sigmoid).
+    Use predict() for inference with sigmoid applied.
+    
     Target: <3M parameters, real-time inference.
     """
     
@@ -408,20 +534,63 @@ class LiteSegNet(nn.Module):
     def _init_weights(self):
         """Initialize model weights using Kaiming initialization.
         
-        Kaiming init is optimal for networks with ReLU activations,
-        as it accounts for the variance reduction from zeroing negative values.
+        - fan_in mode: correct for layers followed by ReLU/ReLU6
+        - Final conv bias initialized to prior that most pixels are non-drivable
+          (prevents the model from starting by predicting everything as road)
         """
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        
+        # Initialize final conv bias to prior: ~30% of pixels are drivable
+        # bias = -log((1 - prior) / prior) = -log(0.7 / 0.3) ≈ -0.847
+        # This ensures the model starts by predicting "mostly non-drivable"
+        final_conv = self.seg_head[-1]
+        if final_conv.bias is not None:
+            nn.init.constant_(final_conv.bias, -0.847)
     
     def forward(self, x):
         """Forward pass through complete LiteSeg network.
+        
+        RETURNS RAW LOGITS — no sigmoid applied.
+        Use predict() for inference.
+        
+        Args:
+            x: Input tensor (N, 3, H, W).
+            
+        Returns:
+            Raw logits (N, 1, H, W). Apply sigmoid externally for probabilities.
+        """
+        input_size = x.shape[2:]
+        
+        # Encoder with skip connections (CoordConv at stem)
+        skip_4x, skip_8x, features = self.encoder(x)
+        
+        # ASPP for multi-scale context
+        aspp_out = self.aspp(features)
+        
+        # Decoder with skip connections and SE attention
+        decoded = self.decoder(aspp_out, skip_8x, skip_4x)
+        
+        # Upsample from 1/4 to full resolution
+        decoded = F.interpolate(decoded, size=input_size, mode='bilinear', align_corners=True)
+        
+        # Segmentation head → raw logits
+        logits = self.seg_head(decoded)
+        
+        return logits
+    
+    def predict(self, x):
+        """Inference-time forward pass with sigmoid.
         
         Args:
             x: Input tensor (N, 3, H, W).
@@ -429,24 +598,7 @@ class LiteSegNet(nn.Module):
         Returns:
             Segmentation probabilities (N, 1, H, W) via sigmoid.
         """
-        input_size = x.shape[2:]
-        
-        # Encoder with skip connections
-        skip_4x, skip_8x, features = self.encoder(x)
-        
-        # ASPP for multi-scale context
-        aspp_out = self.aspp(features)
-        
-        # Decoder with skip connections
-        decoded = self.decoder(aspp_out, skip_8x, skip_4x)
-        
-        # Upsample from 1/4 to full resolution
-        decoded = F.interpolate(decoded, size=input_size, mode='bilinear', align_corners=True)
-        
-        # Segmentation head
-        logits = self.seg_head(decoded)
-        
-        return torch.sigmoid(logits)
+        return torch.sigmoid(self.forward(x))
 
 
 # =============================================================================
@@ -458,6 +610,9 @@ class LiteSegTeacher(nn.Module):
     
     Same architecture as LiteSegNet but with wider channels
     throughout the encoder and decoder to increase capacity.
+    
+    Also uses CoordConv stem and SE attention in decoder.
+    Returns raw logits; use predict() for inference.
     """
     
     def __init__(self, in_channels=3, num_classes=1):
@@ -469,8 +624,11 @@ class LiteSegTeacher(nn.Module):
         """
         super().__init__()
         
-        # Wider encoder
-        self.stem = ConvBNReLU(in_channels, 48, kernel_size=3, stride=2, padding=1)
+        # CoordConv stem (wider)
+        self.coord_conv = CoordConv(in_channels, 48, kernel_size=3, stride=2, padding=1)
+        self.stem_bn = nn.BatchNorm2d(48)
+        self.stem_relu = nn.ReLU6(inplace=True)
+        
         self.stage1 = InvertedResidualBlock(48, 24, stride=1, expand_ratio=1)
         self.stage2 = nn.Sequential(
             InvertedResidualBlock(24, 32, stride=2, expand_ratio=6),
@@ -504,7 +662,7 @@ class LiteSegTeacher(nn.Module):
         # Wider ASPP
         self.aspp = LightweightASPP(in_channels=224, out_channels=192)
         
-        # Wider decoder
+        # Wider decoder with SE attention
         self.decode_8x = DecoderBlock(192, 48, 96)
         self.decode_4x = DecoderBlock(96, 32, 48)
         
@@ -520,25 +678,36 @@ class LiteSegTeacher(nn.Module):
         """Initialize weights with Kaiming initialization."""
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        
+        # Prior: most pixels are non-drivable
+        final_conv = self.seg_head[-1]
+        if final_conv.bias is not None:
+            nn.init.constant_(final_conv.bias, -0.847)
     
     def forward(self, x):
         """Forward pass through teacher model.
+        
+        Returns raw logits.
         
         Args:
             x: Input tensor (N, 3, H, W).
             
         Returns:
-            Segmentation probabilities (N, 1, H, W).
+            Raw logits (N, 1, H, W).
         """
         input_size = x.shape[2:]
         
-        x = self.stem(x)
+        x = self.stem_relu(self.stem_bn(self.coord_conv(x)))
         x = self.stage1(x)
         x = self.stage2(x)
         skip_4x = x
@@ -555,7 +724,18 @@ class LiteSegTeacher(nn.Module):
         x = F.interpolate(x, size=input_size, mode='bilinear', align_corners=True)
         logits = self.seg_head(x)
         
-        return torch.sigmoid(logits)
+        return logits
+    
+    def predict(self, x):
+        """Inference-time forward pass with sigmoid.
+        
+        Args:
+            x: Input tensor (N, 3, H, W).
+            
+        Returns:
+            Segmentation probabilities (N, 1, H, W).
+        """
+        return torch.sigmoid(self.forward(x))
 
 
 # =============================================================================
@@ -586,6 +766,7 @@ def get_model_info(model, input_size=(1, 3, 256, 448)):
         output = model(dummy)
     print(f"Input shape:  {list(dummy.shape)}")
     print(f"Output shape: {list(output.shape)}")
+    print(f"Output range: [{output.min().item():.3f}, {output.max().item():.3f}] (logits)")
     print(f"{'='*50}")
     
     return total_params

@@ -2,8 +2,10 @@
 utils.py — Utility functions for LiteSeg drivable space segmentation.
 
 Contains:
-- Loss functions (ComboLoss, BoundaryAwareLoss)
-- Metrics (IoU, mIoU, confusion matrix)
+- Loss functions (FocalLoss, TverskyLoss, PRISMLossV2, legacy ComboLoss)
+- Boundary-aware loss components
+- Knowledge distillation loss
+- Metrics (IoU, mIoU, Precision, Recall, FPR, confusion matrix)
 - Post-processing (boundary refinement, TTA)
 - Visualization helpers
 """
@@ -17,40 +19,253 @@ from sklearn.metrics import confusion_matrix as sklearn_confusion_matrix
 
 
 # =============================================================================
-# LOSS FUNCTIONS
+# LOSS FUNCTIONS — NEW (Logit-based, false-positive-aware)
+# =============================================================================
+
+class FocalLoss(nn.Module):
+    """Focal Loss for binary segmentation — focuses on hard pixels.
+    
+    Lin et al., 2017 — "Focal Loss for Dense Object Detection"
+    
+    FL(p) = -alpha * (1 - p)^gamma * log(p)   for positive class
+    FL(p) = -(1-alpha) * p^gamma * log(1-p)    for negative class
+    
+    gamma > 0 reduces loss for well-classified pixels, focusing training
+    on hard, misclassified examples (boundary pixels, confusing textures).
+    
+    alpha < 0.5 down-weights the dominant non-drivable class.
+    
+    Operates on RAW LOGITS (uses BCEWithLogitsLoss internally for stability).
+    """
+    
+    def __init__(self, alpha=0.25, gamma=2.0):
+        """Initialize FocalLoss.
+        
+        Args:
+            alpha: Weight for the positive (drivable) class. Default 0.25
+                   means non-drivable gets weight 0.75 — penalizing FPs.
+            gamma: Focusing parameter. Higher = more focus on hard pixels.
+        """
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+    
+    def forward(self, logits, target):
+        """Compute Focal Loss on raw logits.
+        
+        Args:
+            logits: Raw model output, shape (N, 1, H, W).
+            target: Ground truth binary mask, shape (N, 1, H, W), values 0 or 1.
+            
+        Returns:
+            Scalar focal loss.
+        """
+        # Sigmoid probability
+        p = torch.sigmoid(logits)
+        
+        # BCE loss per pixel (no reduction)
+        bce = F.binary_cross_entropy_with_logits(logits, target, reduction='none')
+        
+        # p_t = probability of correct class
+        p_t = p * target + (1 - p) * (1 - target)
+        
+        # Focal weight: (1 - p_t)^gamma
+        focal_weight = (1 - p_t) ** self.gamma
+        
+        # Alpha weighting: alpha for positives, (1-alpha) for negatives
+        alpha_weight = self.alpha * target + (1 - self.alpha) * (1 - target)
+        
+        loss = alpha_weight * focal_weight * bce
+        return loss.mean()
+
+
+class TverskyLoss(nn.Module):
+    """Tversky Loss — Generalizes Dice with separate FP/FN weights.
+    
+    Salehi et al., 2017 — "Tversky loss function for image segmentation"
+    
+    Tversky Index = TP / (TP + alpha*FP + beta*FN)
+    
+    Setting alpha > beta penalizes False Positives more heavily.
+    This directly attacks the "building segmented as road" problem.
+    
+    Setting alpha=0.5, beta=0.5 reduces to standard Dice.
+    """
+    
+    def __init__(self, alpha=0.7, beta=0.3, smooth=1.0):
+        """Initialize TverskyLoss.
+        
+        Args:
+            alpha: Weight for False Positives. Higher = more FP penalty.
+            beta: Weight for False Negatives. Higher = more FN penalty.
+            smooth: Smoothing factor to prevent division by zero.
+        """
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.smooth = smooth
+    
+    def forward(self, logits, target):
+        """Compute Tversky Loss.
+        
+        Args:
+            logits: Raw model output, shape (N, 1, H, W).
+            target: Ground truth binary mask, shape (N, 1, H, W).
+            
+        Returns:
+            Scalar Tversky loss.
+        """
+        pred = torch.sigmoid(logits)
+        pred_flat = pred.contiguous().view(-1)
+        target_flat = target.contiguous().view(-1)
+        
+        # True Positives, False Positives, False Negatives
+        TP = (pred_flat * target_flat).sum()
+        FP = (pred_flat * (1 - target_flat)).sum()
+        FN = ((1 - pred_flat) * target_flat).sum()
+        
+        tversky_index = (TP + self.smooth) / (
+            TP + self.alpha * FP + self.beta * FN + self.smooth
+        )
+        
+        return 1.0 - tversky_index
+
+
+class BoundaryFocalLoss(nn.Module):
+    """Boundary-focused loss that applies extra supervision near edges.
+    
+    Extracts boundary pixels using morphological dilation/erosion,
+    then applies weighted focal BCE only to those boundary pixels.
+    This forces crisp edge predictions without affecting global loss.
+    """
+    
+    def __init__(self, kernel_size=5, boundary_weight=3.0):
+        """Initialize BoundaryFocalLoss.
+        
+        Args:
+            kernel_size: Kernel for morphological boundary extraction.
+            boundary_weight: Extra weight for boundary pixels.
+        """
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.boundary_weight = boundary_weight
+    
+    def _get_boundary_mask(self, target):
+        """Extract boundary band using morphological gradient.
+        
+        Args:
+            target: Binary mask (N, 1, H, W).
+            
+        Returns:
+            Boundary mask (N, 1, H, W) — 1 at boundaries, 0 elsewhere.
+        """
+        k = self.kernel_size
+        p = k // 2
+        dilated = F.max_pool2d(target, k, stride=1, padding=p)
+        eroded = -F.max_pool2d(-target, k, stride=1, padding=p)
+        boundary = (dilated - eroded).clamp(0, 1)
+        return boundary
+    
+    def forward(self, logits, target):
+        """Compute boundary-focused loss.
+        
+        Args:
+            logits: Raw logits (N, 1, H, W).
+            target: Ground truth (N, 1, H, W).
+            
+        Returns:
+            Scalar boundary loss.
+        """
+        boundary = self._get_boundary_mask(target)
+        
+        # Weight map: higher weight at boundaries
+        weight_map = 1.0 + boundary * (self.boundary_weight - 1.0)
+        
+        # Weighted BCE on logits
+        bce = F.binary_cross_entropy_with_logits(
+            logits, target, weight=weight_map, reduction='mean'
+        )
+        return bce
+
+
+class PRISMLossV2(nn.Module):
+    """PRISM Loss V2 — Combined loss for false-positive-aware segmentation.
+    
+    Combines three complementary objectives:
+    1. Focal Loss: Focuses on hard/misclassified pixels, handles class imbalance
+    2. Tversky Loss: Penalizes False Positives (buildings/sky → road) heavily
+    3. Boundary Loss: Extra supervision at drivable area edges
+    
+    All operate on raw logits for numerical stability.
+    
+    PRISMLossV2 = w_focal * FocalLoss + w_tversky * TverskyLoss + w_boundary * BoundaryLoss
+    """
+    
+    def __init__(self, w_focal=0.5, w_tversky=0.3, w_boundary=0.2,
+                 focal_alpha=0.25, focal_gamma=2.0,
+                 tversky_alpha=0.7, tversky_beta=0.3):
+        """Initialize PRISMLossV2.
+        
+        Args:
+            w_focal: Weight for focal loss component.
+            w_tversky: Weight for Tversky loss component.
+            w_boundary: Weight for boundary loss component.
+            focal_alpha: Alpha for focal loss (positive class weight).
+            focal_gamma: Gamma for focal loss (focusing parameter).
+            tversky_alpha: Alpha for Tversky (FP weight). Higher = more FP penalty.
+            tversky_beta: Beta for Tversky (FN weight).
+        """
+        super().__init__()
+        self.w_focal = w_focal
+        self.w_tversky = w_tversky
+        self.w_boundary = w_boundary
+        
+        self.focal = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
+        self.tversky = TverskyLoss(alpha=tversky_alpha, beta=tversky_beta)
+        self.boundary = BoundaryFocalLoss(kernel_size=5, boundary_weight=3.0)
+    
+    def forward(self, logits, target):
+        """Compute combined PRISM loss.
+        
+        Args:
+            logits: Raw model output (N, 1, H, W).
+            target: Ground truth binary mask (N, 1, H, W).
+            
+        Returns:
+            Scalar combined loss.
+        """
+        loss_focal = self.focal(logits, target)
+        loss_tversky = self.tversky(logits, target)
+        loss_boundary = self.boundary(logits, target)
+        
+        return (self.w_focal * loss_focal + 
+                self.w_tversky * loss_tversky + 
+                self.w_boundary * loss_boundary)
+
+
+# =============================================================================
+# LEGACY LOSS FUNCTIONS (backward compatibility)
 # =============================================================================
 
 class DiceLoss(nn.Module):
     """Dice loss for binary segmentation — handles class imbalance.
     
-    Dice = 2 * |pred ∩ gt| / (|pred| + |gt|)
-    Loss = 1 - Dice
-    
-    Smooth term prevents division by zero.
+    Operates on probabilities (apply sigmoid before calling if using logits).
     """
     
     def __init__(self, smooth=1.0):
-        """Initialize DiceLoss.
-        
-        Args:
-            smooth: Smoothing factor to prevent division by zero.
-        """
         super().__init__()
         self.smooth = smooth
     
     def forward(self, pred, target):
-        """Compute Dice loss.
+        """Compute Dice loss on probabilities.
         
         Args:
-            pred: Predicted probabilities, shape (N, 1, H, W).
-            target: Ground truth binary mask, shape (N, 1, H, W).
-            
-        Returns:
-            Scalar dice loss.
+            pred: Predicted probabilities (N, 1, H, W).
+            target: Ground truth (N, 1, H, W).
         """
         pred = pred.contiguous().view(-1)
         target = target.contiguous().view(-1)
-        
         intersection = (pred * target).sum()
         dice = (2.0 * intersection + self.smooth) / (
             pred.sum() + target.sum() + self.smooth
@@ -59,56 +274,33 @@ class DiceLoss(nn.Module):
 
 
 class ComboLoss(nn.Module):
-    """Combination of Binary Cross-Entropy and Dice Loss.
+    """Legacy Combination of BCE and Dice Loss (for backward compatibility).
     
-    ComboLoss = alpha * BCE + (1 - alpha) * Dice
-    
-    BCE handles per-pixel classification accuracy.
-    Dice handles global overlap / class imbalance.
+    Now operates on logits: applies sigmoid internally.
     """
     
     def __init__(self, alpha=0.5, smooth=1.0):
-        """Initialize ComboLoss.
-        
-        Args:
-            alpha: Weight for BCE (1-alpha for Dice). Default 0.5.
-            smooth: Smoothing factor for Dice loss.
-        """
         super().__init__()
         self.alpha = alpha
-        self.bce = nn.BCELoss()
         self.dice = DiceLoss(smooth=smooth)
     
-    def forward(self, pred, target):
-        """Compute combo loss.
+    def forward(self, logits, target):
+        """Compute combo loss on logits.
         
         Args:
-            pred: Predicted probabilities, shape (N, 1, H, W).
-            target: Ground truth binary mask, shape (N, 1, H, W).
-            
-        Returns:
-            Scalar combo loss.
+            logits: Raw logits (N, 1, H, W).
+            target: Ground truth (N, 1, H, W).
         """
-        bce_loss = self.bce(pred, target)
+        bce_loss = F.binary_cross_entropy_with_logits(logits, target)
+        pred = torch.sigmoid(logits)
         dice_loss = self.dice(pred, target)
         return self.alpha * bce_loss + (1.0 - self.alpha) * dice_loss
 
 
 class BoundaryAwareLoss(nn.Module):
-    """Boundary-aware loss that applies extra weighting near drivable boundaries.
-    
-    Detects boundary pixels using morphological gradient, then applies
-    higher loss weight at boundary regions to improve edge quality.
-    """
+    """Legacy boundary-aware loss. Now operates on logits."""
     
     def __init__(self, alpha=0.5, boundary_weight=2.0, kernel_size=5):
-        """Initialize BoundaryAwareLoss.
-        
-        Args:
-            alpha: Weight for BCE vs Dice in base combo loss.
-            boundary_weight: Extra weight multiplier for boundary pixels.
-            kernel_size: Kernel size for boundary detection.
-        """
         super().__init__()
         self.alpha = alpha
         self.boundary_weight = boundary_weight
@@ -116,93 +308,47 @@ class BoundaryAwareLoss(nn.Module):
         self.dice = DiceLoss()
     
     def _get_boundary_mask(self, target):
-        """Extract boundary pixels using morphological gradient.
-        
-        Args:
-            target: Binary mask tensor, shape (N, 1, H, W).
-            
-        Returns:
-            Boundary mask tensor, same shape as target.
-        """
-        # Use max pooling to dilate and -min pooling (via max of negated) to erode
         kernel = self.kernel_size
         padding = kernel // 2
         dilated = F.max_pool2d(target, kernel, stride=1, padding=padding)
         eroded = -F.max_pool2d(-target, kernel, stride=1, padding=padding)
-        boundary = dilated - eroded
-        return boundary
+        return dilated - eroded
     
-    def forward(self, pred, target):
-        """Compute boundary-aware loss.
-        
-        Args:
-            pred: Predicted probabilities, shape (N, 1, H, W).
-            target: Ground truth binary mask, shape (N, 1, H, W).
-            
-        Returns:
-            Scalar boundary-aware loss.
-        """
-        # Get boundary mask for extra weighting
+    def forward(self, logits, target):
         boundary = self._get_boundary_mask(target)
-        
-        # Weight map: 1.0 everywhere + extra weight at boundaries
         weight_map = 1.0 + boundary * (self.boundary_weight - 1.0)
-        
-        # Weighted BCE
-        bce = F.binary_cross_entropy(pred, target, weight=weight_map)
-        
-        # Standard Dice (global, not pixel-weighted)
+        bce = F.binary_cross_entropy_with_logits(logits, target, weight=weight_map)
+        pred = torch.sigmoid(logits)
         dice_loss = self.dice(pred, target)
-        
         return self.alpha * bce + (1.0 - self.alpha) * dice_loss
 
 
 class DistillationLoss(nn.Module):
-    """Knowledge distillation loss combining task loss and soft-target loss.
+    """Knowledge distillation loss using PRISMLossV2 as task loss.
     
     Loss = alpha * task_loss(student, gt) + (1-alpha) * KD_loss(student, teacher)
     
-    KD loss uses soft probabilities from the teacher to guide the student.
-    
-    Upgraded: task_loss now defaults to PRISMLoss for better class-imbalance
-    handling on small datasets. Pass task_loss=ComboLoss() to restore original
-    behaviour.
+    Both student and teacher outputs are raw logits.
     """
     
-    def __init__(self, alpha=0.5, temperature=3.0, task_loss=None):
-        """Initialize DistillationLoss.
-        
-        Args:
-            alpha: Weight for ground-truth task loss vs distillation loss.
-            temperature: Temperature for softening probabilities.
-            task_loss: Loss function for ground-truth supervision.
-                       Defaults to PRISMLoss (recommended for nuScenes).
-                       Pass ComboLoss() to restore original behaviour.
-        """
+    def __init__(self, alpha=0.5, temperature=3.0):
         super().__init__()
         self.alpha = alpha
         self.temperature = temperature
-        self.task_loss = task_loss if task_loss is not None else PRISMLoss()
+        self.task_loss = PRISMLossV2()
     
-    def forward(self, student_pred, teacher_pred, target):
+    def forward(self, student_logits, teacher_logits, target):
         """Compute distillation loss.
         
         Args:
-            student_pred: Student model output probabilities (N, 1, H, W).
-            teacher_pred: Teacher model output probabilities (N, 1, H, W).
-            target: Ground truth binary mask (N, 1, H, W).
-            
-        Returns:
-            Scalar distillation loss.
+            student_logits: Student raw logits (N, 1, H, W).
+            teacher_logits: Teacher raw logits (N, 1, H, W).
+            target: Ground truth (N, 1, H, W).
         """
         # Task loss against ground truth
-        task = self.task_loss(student_pred, target)
+        task = self.task_loss(student_logits, target)
         
-        # Soft target loss — MSE between student and teacher soft predictions
-        # Apply temperature scaling in logit space
-        student_logits = torch.logit(student_pred.clamp(1e-6, 1 - 1e-6))
-        teacher_logits = torch.logit(teacher_pred.clamp(1e-6, 1 - 1e-6))
-        
+        # Soft target loss with temperature scaling
         student_soft = torch.sigmoid(student_logits / self.temperature)
         teacher_soft = torch.sigmoid(teacher_logits / self.temperature)
         
@@ -212,225 +358,14 @@ class DistillationLoss(nn.Module):
 
 
 # =============================================================================
-# NEW LOSS FUNCTIONS — optimised for nuScenes small-dataset training
-# =============================================================================
-
-class FocalTverskyLoss(nn.Module):
-    """Focal Tversky Loss — handles class imbalance better than BCE+Dice.
-
-    Tversky index generalises Dice by letting you penalise False Negatives
-    and False Positives asymmetrically via alpha/beta:
-
-        Tversky = TP / (TP + alpha*FP + beta*FN)
-
-    The Focal exponent gamma then down-weights easy examples so the
-    optimiser concentrates on hard, ambiguous pixels:
-
-        FocalTversky = (1 - Tversky)^gamma
-
-    Why this beats ComboLoss on nuScenes:
-        - nuScenes drivable labels are heavily imbalanced (road >> obstacles).
-        - Standard Dice weights FP and FN equally — wrong for safety-critical
-          segmentation where missing road (FN) is more costly than over-
-          predicting road (FP).
-        - The focal term automatically down-weights the easy, high-confidence
-          road-centre pixels and forces the model to focus on hard boundary
-          pixels — exactly where mIoU is won or lost.
-
-    Recommended defaults:
-        alpha=0.3, beta=0.7  — penalise FN more (conservative: prefer
-                               predicting road over missing road)
-        gamma=0.75           — mild focal effect; raise to 1.5 if the model
-                               is still ignoring hard examples after 10 epochs
-
-    Args:
-        alpha: FP weight in Tversky denominator.  alpha + beta should = 1.
-        beta:  FN weight in Tversky denominator.
-        gamma: Focal exponent. 0 = standard Tversky, >0 = focal weighting.
-        smooth: Smoothing constant to prevent division by zero.
-    """
-
-    def __init__(self, alpha=0.3, beta=0.7, gamma=0.75, smooth=1.0):
-        super().__init__()
-        self.alpha = alpha
-        self.beta = beta
-        self.gamma = gamma
-        self.smooth = smooth
-
-    def forward(self, pred, target):
-        """Compute Focal Tversky loss.
-
-        Args:
-            pred:   (N, 1, H, W) sigmoid probabilities in [0, 1].
-            target: (N, 1, H, W) float binary ground truth {0, 1}.
-
-        Returns:
-            Scalar Focal Tversky loss.
-        """
-        pred_flat   = pred.contiguous().view(-1)
-        target_flat = target.contiguous().view(-1)
-
-        tp = (pred_flat * target_flat).sum()
-        fp = (pred_flat * (1.0 - target_flat)).sum()
-        fn = ((1.0 - pred_flat) * target_flat).sum()
-
-        tversky = (tp + self.smooth) / (
-            tp + self.alpha * fp + self.beta * fn + self.smooth
-        )
-
-        focal_tversky = (1.0 - tversky) ** self.gamma
-        return focal_tversky
-
-
-class BFABoundaryLoss(nn.Module):
-    """Boundary Feature Analysis loss — sharpens drivable space edges.
-
-    Inspired by BFANet (CVPR 2025). Computes a boundary pseudo-label by
-    comparing a dilated and an eroded version of the GT mask, then applies
-    a focused BCE loss only on those boundary pixels.
-
-    Why this matters:
-        - Most segmentation errors on nuScenes happen at the road edge
-          (where road meets kerb, grass, or puddle).
-        - Standard Dice/BCE treat all pixels equally — boundary pixels are a
-          tiny fraction so their gradient signal is drowned out.
-        - This loss isolates boundary pixels and applies full BCE loss on
-          just those pixels, forcing the model to get edges right.
-
-    How the pseudo-label is built:
-        dilated_mask  = max_pool(GT, kernel)   — expands the road region
-        eroded_mask   = -max_pool(-GT, kernel) — shrinks the road region
-        boundary      = dilated - eroded       — only the edge band
-
-    Args:
-        dilation_kernel: Pixel width of the boundary band. Larger = thicker
-                         boundary region that gets supervised. Default 7
-                         works well for 256×448 resolution.
-        weight: (Deprecated) Kept for backward compatibility but ignored.
-                Overall boundary loss weighting should be applied externally
-                (e.g., in PRISMLoss).
-    """
-
-    def __init__(self, dilation_kernel=7, weight=1.0):
-        super().__init__()
-        self.dilation_kernel = dilation_kernel
-        # Padding to keep spatial dimensions unchanged
-        self.padding = dilation_kernel // 2
-
-    def _boundary_pseudo_label(self, target):
-        """Compute boundary pseudo-label from GT mask.
-
-        Args:
-            target: (N, 1, H, W) float binary GT.
-
-        Returns:
-            (N, 1, H, W) float boundary mask — 1 at boundary, 0 elsewhere.
-        """
-        k = self.dilation_kernel
-        p = self.padding
-        dilated = F.max_pool2d(target, k, stride=1, padding=p)
-        eroded  = -F.max_pool2d(-target, k, stride=1, padding=p)
-        boundary = (dilated - eroded).clamp(0.0, 1.0)
-        return boundary
-
-    def forward(self, pred, target):
-        """Compute BFA boundary loss.
-
-        Args:
-            pred:   (N, 1, H, W) sigmoid probabilities.
-            target: (N, 1, H, W) float binary ground truth.
-
-        Returns:
-            Scalar boundary BCE loss. Returns 0 if no boundary pixels exist.
-        """
-        boundary = self._boundary_pseudo_label(target)
-
-        # Only supervise pixels inside the boundary band
-        n_boundary = boundary.sum()
-        if n_boundary < 1.0:
-            return pred.sum() * 0.0  # Zero loss, but keeps gradient graph
-
-        boundary_pred   = pred[boundary > 0.5]
-        boundary_target = target[boundary > 0.5]
-
-        return F.binary_cross_entropy(boundary_pred, boundary_target)
-
-
-class PRISMLoss(nn.Module):
-    """Combined loss for PRISM — recommended replacement for ComboLoss.
-
-    PRISMLoss = FocalTversky  +  boundary_weight * BFABoundary
-
-    Why this combination works on small datasets:
-        - FocalTversky handles the global class imbalance and forces the
-          model to focus on hard pixels rather than easy road-centre pixels.
-        - BFABoundary applies targeted supervision at edge pixels — the
-          exact locations where the mIoU score is determined.
-        - Together they cover two independent failure modes of ComboLoss:
-          ignoring rare classes and blurring boundaries.
-
-    Drop-in replacement for ComboLoss and BoundaryAwareLoss in train.py:
-
-        # Before
-        criterion = ComboLoss(alpha=0.5)
-        # After
-        criterion = PRISMLoss()
-
-    The train.py --loss argument is extended to accept 'prism':
-
-        python train.py --loss prism
-
-    Args:
-        alpha:          FP weight in Tversky (see FocalTverskyLoss).
-        beta:           FN weight in Tversky.
-        gamma:          Focal exponent.
-        smooth:         Tversky smoothing constant.
-        boundary_weight: Scalar weight for the BFA boundary term.
-                         0.0 = pure FocalTversky (no boundary supervision).
-                         0.4 = recommended starting point.
-                         Raise to 0.6 if boundary mIoU is still poor after
-                         20 epochs.
-        dilation_kernel: Boundary band width (pixels) for BFABoundaryLoss.
-    """
-
-    def __init__(
-        self,
-        alpha=0.3,
-        beta=0.7,
-        gamma=0.75,
-        smooth=1.0,
-        boundary_weight=0.4,
-        dilation_kernel=7,
-    ):
-        super().__init__()
-        self.focal_tversky  = FocalTverskyLoss(alpha, beta, gamma, smooth)
-        self.boundary       = BFABoundaryLoss(dilation_kernel)
-        self.boundary_weight = boundary_weight
-
-    def forward(self, pred, target):
-        """Compute PRISMLoss.
-
-        Args:
-            pred:   (N, 1, H, W) sigmoid probabilities.
-            target: (N, 1, H, W) float binary ground truth.
-
-        Returns:
-            Scalar combined loss.
-        """
-        ft_loss  = self.focal_tversky(pred, target)
-        bfa_loss = self.boundary(pred, target)
-        return ft_loss + self.boundary_weight * bfa_loss
-
-
-# =============================================================================
-# METRICS
+# METRICS — Enhanced with false-positive detection
 # =============================================================================
 
 def compute_iou(pred, target, threshold=0.5):
-    """Compute Intersection-over-Union for binary segmentation.
+    """Compute IoU for binary segmentation.
     
     Args:
-        pred: Predicted probabilities, shape (N, 1, H, W) or (H, W).
+        pred: Predicted probabilities or logits, shape (N, 1, H, W) or (H, W).
         target: Ground truth binary mask, same shape.
         threshold: Threshold to binarize predictions.
         
@@ -447,34 +382,89 @@ def compute_iou(pred, target, threshold=0.5):
         union = ((pred + target) > 0).astype(np.float32).sum()
     
     if union == 0:
-        return 1.0  # Both empty
+        return 1.0
     return intersection / union
 
 
 def compute_miou(pred, target, threshold=0.5):
-    """Compute mean IoU over both classes (drivable and non-drivable).
+    """Compute mean IoU over both classes.
     
     Args:
-        pred: Predicted probabilities, shape (N, 1, H, W).
+        pred: Predicted probabilities (after sigmoid), shape (N, 1, H, W).
         target: Ground truth binary mask, same shape.
         threshold: Threshold to binarize predictions.
         
     Returns:
         Tuple of (mIoU, iou_drivable, iou_non_drivable).
     """
-    if isinstance(pred, torch.Tensor):
-        pred_bin = (pred > threshold).float()
-    else:
-        pred_bin = (pred > threshold).astype(np.float32)
-    
-    # IoU for drivable class (label = 1)
     iou_drivable = compute_iou(pred, target, threshold)
-    
-    # IoU for non-drivable class (label = 0)
     iou_non_drivable = compute_iou(1 - pred, 1 - target, threshold)
-    
     miou = (iou_drivable + iou_non_drivable) / 2.0
     return miou, iou_drivable, iou_non_drivable
+
+
+def compute_detailed_metrics(pred, target, threshold=0.5):
+    """Compute comprehensive metrics including false-positive detection.
+    
+    THIS IS THE KEY METRIC FUNCTION that exposes the false-positive bleeding
+    that mIoU alone hides.
+    
+    Args:
+        pred: Predicted probabilities (after sigmoid), shape (N, 1, H, W).
+        target: Ground truth binary mask, shape (N, 1, H, W).
+        threshold: Binarization threshold.
+        
+    Returns:
+        Dict with: mIoU, iou_drivable, iou_non_drivable,
+                   precision, recall, f1, fpr (false positive rate)
+    """
+    if isinstance(pred, torch.Tensor):
+        pred_bin = (pred > threshold).float()
+        target_f = target.float()
+        
+        TP = (pred_bin * target_f).sum().item()
+        FP = (pred_bin * (1 - target_f)).sum().item()
+        FN = ((1 - pred_bin) * target_f).sum().item()
+        TN = ((1 - pred_bin) * (1 - target_f)).sum().item()
+    else:
+        pred_bin = (pred > threshold).astype(np.float32)
+        target_f = target.astype(np.float32)
+        
+        TP = (pred_bin * target_f).sum()
+        FP = (pred_bin * (1 - target_f)).sum()
+        FN = ((1 - pred_bin) * target_f).sum()
+        TN = ((1 - pred_bin) * (1 - target_f)).sum()
+    
+    # Precision: of all predicted-drivable, how many are actually drivable?
+    precision = TP / (TP + FP + 1e-8)
+    
+    # Recall: of all actually-drivable, how many did we find?
+    recall = TP / (TP + FN + 1e-8)
+    
+    # F1 score
+    f1 = 2 * precision * recall / (precision + recall + 1e-8)
+    
+    # FALSE POSITIVE RATE: of all non-drivable pixels, how many did we
+    # incorrectly predict as drivable? This is the KEY metric for detecting
+    # "building/sky/pole segmented as road"
+    fpr = FP / (FP + TN + 1e-8)
+    
+    # Standard mIoU
+    miou, iou_drv, iou_non = compute_miou(pred, target, threshold)
+    
+    return {
+        'miou': miou,
+        'iou_drivable': iou_drv,
+        'iou_non_drivable': iou_non,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'fpr': fpr,
+        'tp': TP,
+        'fp': FP,
+        'fn': FN,
+        'tn': TN,
+    }
 
 
 def compute_confusion_matrix(pred, target, threshold=0.5):
@@ -506,9 +496,6 @@ def compute_confusion_matrix(pred, target, threshold=0.5):
 def boundary_refinement(mask, kernel_size=5):
     """Apply morphological boundary refinement to clean jagged mask edges.
     
-    Applies closing (dilation→erosion) to fill small holes,
-    then opening (erosion→dilation) to remove small noise.
-    
     Args:
         mask: Binary mask as numpy array (H, W), values 0 or 1.
         kernel_size: Size of morphological kernel.
@@ -519,9 +506,7 @@ def boundary_refinement(mask, kernel_size=5):
     kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
     )
-    # Closing: fill small holes in drivable area
     refined = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
-    # Opening: remove small noise blobs
     refined = cv2.morphologyEx(refined, cv2.MORPH_OPEN, kernel)
     return refined.astype(np.float32)
 
@@ -529,11 +514,10 @@ def boundary_refinement(mask, kernel_size=5):
 def test_time_augmentation(model, image, device='cpu'):
     """Apply Test-Time Augmentation (horizontal flip averaging).
     
-    Averages predictions from the original image and its horizontal flip
-    for a free mIoU improvement.
+    Uses model.predict() to get probabilities.
     
     Args:
-        model: Trained segmentation model.
+        model: Trained segmentation model (returns logits from forward).
         image: Input tensor, shape (1, 3, H, W).
         device: Device to run inference on.
         
@@ -542,17 +526,11 @@ def test_time_augmentation(model, image, device='cpu'):
     """
     model.eval()
     with torch.no_grad():
-        # Original prediction
-        pred_orig = model(image.to(device))
-        
-        # Flipped prediction
-        image_flip = torch.flip(image, dims=[3])  # Horizontal flip
-        pred_flip = model(image_flip.to(device))
-        pred_flip = torch.flip(pred_flip, dims=[3])  # Flip back
-        
-        # Average
+        pred_orig = model.predict(image.to(device))
+        image_flip = torch.flip(image, dims=[3])
+        pred_flip = model.predict(image_flip.to(device))
+        pred_flip = torch.flip(pred_flip, dims=[3])
         pred_avg = (pred_orig + pred_flip) / 2.0
-    
     return pred_avg
 
 
@@ -573,15 +551,12 @@ def create_overlay(image, mask, alpha=0.5):
     """
     overlay = image.copy()
     
-    # Green for drivable
     green_mask = np.zeros_like(image)
-    green_mask[:, :, 1] = 255  # Green channel
+    green_mask[:, :, 1] = 255
     
-    # Red for non-drivable  
     red_mask = np.zeros_like(image)
-    red_mask[:, :, 2] = 255  # Red channel (BGR) or index 0 for RGB
+    red_mask[:, :, 2] = 255
     
-    # Apply masks
     drivable = mask > 0.5
     non_drivable = ~drivable
     
@@ -639,10 +614,9 @@ def compute_dataset_stats(dataloader):
     
     Args:
         dataloader: PyTorch DataLoader providing (image, mask) tuples.
-            Images should be normalized to [0, 1].
             
     Returns:
-        Tuple of (mean, std) — each a list of 3 floats (per channel).
+        Tuple of (mean, std) — each a list of 3 floats.
     """
     mean = torch.zeros(3)
     std = torch.zeros(3)

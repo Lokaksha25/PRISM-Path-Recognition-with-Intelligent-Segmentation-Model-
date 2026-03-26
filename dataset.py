@@ -24,16 +24,18 @@ from albumentations.pytorch import ToTensorV2
 # =============================================================================
 
 def get_train_augmentations(img_height=256, img_width=448, mean=None, std=None):
-    """Get training augmentation pipeline.
+    """Get HARDENED training augmentation pipeline.
     
-    Includes:
-    - Random horizontal flip (road is symmetric)
-    - Random brightness/contrast (lighting variation)
-    - Random crop and resize (scale variation)
-    - Coarse dropout (simulates occlusion)
-    - Gamma correction (simulates night/low-light)
-    - Random shadow simulation (reflective surfaces)
-    - Normalize with dataset-computed mean/std
+    Designed for from-scratch training without pretrained weights.
+    Forces the model to learn textures and geometry, not colors.
+    
+    Groups:
+    1. Spatial: flip, crop, perspective, grid distortion
+    2. Lighting edge cases: night sim, overexposure, fog, sun flare
+    3. Color breaking: aggressive jitter, CLAHE, channel shuffle
+    4. Occlusion/noise: dropout, blur, gaussian noise
+    
+    Uses A.OneOf blocks to prevent over-stacking (max ~3 augmentations per sample).
     
     Args:
         img_height: Target image height.
@@ -45,7 +47,7 @@ def get_train_augmentations(img_height=256, img_width=448, mean=None, std=None):
         albumentations.Compose pipeline.
     """
     if mean is None:
-        mean = [0.485, 0.456, 0.406]  # Will be replaced with computed values
+        mean = [0.485, 0.456, 0.406]
     if std is None:
         std = [0.229, 0.224, 0.225]
     
@@ -53,58 +55,88 @@ def get_train_augmentations(img_height=256, img_width=448, mean=None, std=None):
         # Resize to target resolution
         A.Resize(height=img_height, width=img_width),
         
-        # Spatial augmentations
+        # ── GROUP 1: SPATIAL (geometry learning) ──
         A.HorizontalFlip(p=0.5),
         A.RandomResizedCrop(
             size=(img_height, img_width),
-            scale=(0.8, 1.0),
+            scale=(0.75, 1.0),
             ratio=(1.5, 2.0),
             p=0.3
         ),
+        A.OneOf([
+            A.Perspective(scale=(0.02, 0.06), p=1.0),
+            A.GridDistortion(num_steps=5, distort_limit=0.15, p=1.0),
+            A.ElasticTransform(alpha=30, sigma=5, p=1.0),
+        ], p=0.25),
         
-        # Color augmentations (simulate lighting conditions)
-        A.RandomBrightnessContrast(
-            brightness_limit=0.3,
-            contrast_limit=0.3,
-            p=0.5
-        ),
+        # ── GROUP 2: LIGHTING EDGE CASES (night/glare simulation) ──
+        A.OneOf([
+            # Night simulation: aggressive darkening + gamma
+            A.Compose([
+                A.RandomBrightnessContrast(brightness_limit=(-0.5, -0.2), contrast_limit=0.3, p=1.0),
+                A.RandomGamma(gamma_limit=(40, 80), p=1.0),
+            ]),
+            # Overexposure / glare simulation
+            A.Compose([
+                A.RandomBrightnessContrast(brightness_limit=(0.2, 0.5), contrast_limit=(-0.2, 0.1), p=1.0),
+            ]),
+            # Fog simulation
+            A.RandomFog(fog_coef_range=(0.1, 0.35), alpha_coef=0.1, p=1.0),
+            # Sun flare (glare from headlights / sun)
+            A.RandomSunFlare(
+                flare_roi=(0, 0, 1, 0.5),
+                src_radius=120,
+                num_flare_circles_range=(3, 6),
+                p=1.0
+            ),
+            # Shadow simulation (cast shadows on road surface)
+            A.RandomShadow(
+                shadow_roi=(0, 0.3, 1, 1),
+                num_shadows_limit=(1, 3),
+                shadow_dimension=5,
+                p=1.0
+            ),
+        ], p=0.4),
         
-        # Gamma correction (simulate night scenes)
-        A.RandomGamma(gamma_limit=(60, 140), p=0.3),
+        # ── GROUP 3: COLOR BREAKING (force texture/geometry learning) ──
+        A.OneOf([
+            # CLAHE — contrast-limited adaptive histogram equalization
+            # Simulates different camera ISP pipelines
+            A.CLAHE(clip_limit=(2, 6), tile_grid_size=(8, 8), p=1.0),
+            # Aggressive color jitter — breaks color memorization
+            A.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.5, hue=0.15, p=1.0),
+            # Hue/Saturation shift
+            A.HueSaturationValue(hue_shift_limit=25, sat_shift_limit=40, val_shift_limit=30, p=1.0),
+            # Random tone curve (simulates different exposures)
+            A.RandomToneCurve(scale=0.2, p=1.0),
+            # Channel shuffle — completely breaks color dependence
+            A.ChannelShuffle(p=1.0),
+        ], p=0.5),
         
-        # Simulate reflective surfaces / water puddles
-        A.RandomToneCurve(scale=0.1, p=0.2),
+        # Mild brightness/contrast on top (always useful)
+        A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.3),
         
-        # Color jitter for robustness
-        A.HueSaturationValue(
-            hue_shift_limit=10,
-            sat_shift_limit=20,
-            val_shift_limit=20,
-            p=0.3
-        ),
-        
-        # Occlusion simulation
+        # ── GROUP 4: OCCLUSION & NOISE ──
+        # Simulate sensor artifacts / partial occlusion
         A.CoarseDropout(
-            max_holes=8,
-            max_height=32,
-            max_width=32,
-            min_holes=1,
-            min_height=8,
-            min_width=8,
+            num_holes_range=(1, 8),
+            hole_height_range=(10, 40),
+            hole_width_range=(10, 40),
             fill_value=0,
             p=0.3
         ),
         
-        # Blur (simulate motion / defocus)
+        # Blur (motion / defocus / rain on lens)
         A.OneOf([
             A.GaussianBlur(blur_limit=(3, 7)),
-            A.MotionBlur(blur_limit=(3, 7)),
-        ], p=0.2),
+            A.MotionBlur(blur_limit=(3, 9)),
+            A.MedianBlur(blur_limit=5),
+        ], p=0.25),
         
-        # Noise
-        A.GaussNoise(std_range=(0.02, 0.05), p=0.2),
+        # Sensor noise
+        A.GaussNoise(std_range=(0.02, 0.08), p=0.25),
         
-        # Normalize and convert to tensor
+        # ── NORMALIZE & CONVERT ──
         A.Normalize(mean=mean, std=std),
         ToTensorV2(),
     ])

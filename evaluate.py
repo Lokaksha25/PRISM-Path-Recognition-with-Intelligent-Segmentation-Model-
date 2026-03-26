@@ -25,8 +25,9 @@ from tqdm import tqdm
 from model import LiteSegNet, LiteSegTeacher
 from dataset import get_dataloaders, get_val_augmentations, NuScenesDrivableDataset
 from utils import (
-    compute_miou, compute_confusion_matrix, boundary_refinement,
-    test_time_augmentation, create_overlay, save_comparison, count_parameters
+    compute_miou, compute_detailed_metrics, compute_confusion_matrix,
+    boundary_refinement, test_time_augmentation, create_overlay,
+    save_comparison, count_parameters, PRISMLossV2
 )
 
 
@@ -109,7 +110,8 @@ def evaluate_full(model, dataloader, device, use_tta=False,
         if use_tta:
             predictions = test_time_augmentation(model, images, device)
         else:
-            predictions = model(images)
+            # Use model.predict() to get probabilities (sigmoid applied)
+            predictions = model.predict(images)
         
         # Apply boundary refinement if requested
         if use_boundary_ref:
@@ -133,16 +135,20 @@ def evaluate_full(model, dataloader, device, use_tta=False,
     all_preds = torch.cat(all_preds, dim=0)
     all_targets = torch.cat(all_targets, dim=0)
     
-    # Overall metrics
-    overall_miou, overall_iou_drv, overall_iou_non = compute_miou(all_preds, all_targets)
+    # Overall metrics (including FPR/Precision/Recall)
+    detailed = compute_detailed_metrics(all_preds, all_targets)
     
     # Confusion matrix
     cm = compute_confusion_matrix(all_preds, all_targets)
     
     return {
-        'miou': overall_miou,
-        'iou_drivable': overall_iou_drv,
-        'iou_non_drivable': overall_iou_non,
+        'miou': detailed['miou'],
+        'iou_drivable': detailed['iou_drivable'],
+        'iou_non_drivable': detailed['iou_non_drivable'],
+        'precision': detailed['precision'],
+        'recall': detailed['recall'],
+        'fpr': detailed['fpr'],
+        'f1': detailed['f1'],
         'confusion_matrix': cm.tolist(),
         'predictions': all_preds,
         'targets': all_targets,
@@ -250,7 +256,7 @@ def per_scene_evaluation(model, dataroot, mask_dir, device,
             image = image.unsqueeze(0).to(device)
             mask = mask.unsqueeze(0).to(device)
             
-            pred = model(image)
+            pred = model.predict(image)
             miou, iou_drv, _ = compute_miou(pred, mask)
             
             # Try to map to scene
@@ -312,7 +318,7 @@ def generate_visualizations(model, dataroot, mask_dir, device, output_dir,
         
         # Get prediction
         with torch.no_grad():
-            pred = model(image_tensor.unsqueeze(0).to(device))
+            pred = model.predict(image_tensor.unsqueeze(0).to(device))
         
         pred_np = pred.cpu().numpy()[0, 0]
         mask_np = mask_tensor.numpy()[0]
@@ -484,11 +490,15 @@ def main():
     print(f"\n{'='*60}")
     print(f"EVALUATION RESULTS")
     print(f"{'='*60}")
-    print(f"\n{'Metric':<30} {'Value':>15} {'Target':>15}")
+    print(f"{'Metric':<30} {'Value':>15} {'Target':>15}")
     print(f"{'─'*60}")
     print(f"{'mIoU (overall binary)':<30} {results['miou']:>15.4f} {'> 0.75':>15}")
     print(f"{'mIoU (drivable class)':<30} {results['iou_drivable']:>15.4f} {'> 0.72':>15}")
     print(f"{'mIoU (non-drivable)':<30} {results['iou_non_drivable']:>15.4f} {'—':>15}")
+    print(f"{'Precision':<30} {results['precision']:>15.4f} {'> 0.80':>15}")
+    print(f"{'Recall':<30} {results['recall']:>15.4f} {'> 0.70':>15}")
+    print(f"{'False Positive Rate (FPR)':<30} {results['fpr']:>15.4f} {'< 0.10':>15}")
+    print(f"{'F1 Score':<30} {results['f1']:>15.4f} {'> 0.75':>15}")
     print(f"{'Inference FPS (' + str(device) + ')':<30} {fps_stats['fps']:>15.1f} {'> 30 (CPU)':>15}")
     print(f"{'Mean Latency (ms)':<30} {fps_stats['mean_latency_ms']:>15.2f} {'—':>15}")
     print(f"{'Model Parameters':<30} {n_params:>15,} {'< 3M':>15}")

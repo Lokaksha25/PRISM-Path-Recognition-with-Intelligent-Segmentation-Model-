@@ -163,7 +163,7 @@ class LiteSegInference:
             if tta:
                 probs = test_time_augmentation(self.model, tensor, self.device)
             else:
-                probs = self.model(tensor)
+                probs = self.model.predict(tensor)
         
         # Post-process
         prob_map = probs.cpu().numpy()[0, 0]
