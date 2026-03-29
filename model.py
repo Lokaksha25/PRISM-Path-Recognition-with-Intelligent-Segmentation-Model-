@@ -425,6 +425,8 @@ class DecoderBlock(nn.Module):
         )
         # Channel attention after refinement
         self.se = SqueezeExcite(out_channels, reduction=4)
+        # Spatial dropout to reduce overfitting (only active during training)
+        self.dropout = nn.Dropout2d(0.15)
     
     def forward(self, x, skip):
         """Forward pass with skip connection and SE attention.
@@ -444,6 +446,8 @@ class DecoderBlock(nn.Module):
         x = self.refine(x)
         # Channel attention
         x = self.se(x)
+        # Dropout for regularization
+        x = self.dropout(x)
         return x
 
 
