@@ -4,6 +4,7 @@ model.py — LiteSeg: Lightweight Segmentation Network for Drivable Space.
 Custom architecture built entirely from scratch:
 - Encoder: MobileNetV2-style inverted residual blocks (depthwise separable convolutions)
 - CoordConv: Injects (x, y) positional channels for spatial awareness
+- RAU: Reflection Attention Unit — detects water puddles via sky-ground vertical correlation
 - Squeeze-Excite attention in decoder for channel recalibration
 - Decoder: Lightweight ASPP (dilation rates 6, 12, 18) + U-Net skip connections
 - Output: Raw logits (sigmoid applied externally for numerical stability)
@@ -34,35 +35,16 @@ class AddCoords(nn.Module):
         super().__init__()
     
     def forward(self, x):
-        """Add coordinate channels to input.
-        
-        Args:
-            x: Input tensor (N, C, H, W).
-            
-        Returns:
-            Tensor (N, C+2, H, W) with x and y coordinate channels appended.
-        """
         B, _, H, W = x.shape
-        
-        # Create normalized coordinate grids [-1, 1]
         y_coords = torch.linspace(-1, 1, H, device=x.device, dtype=x.dtype)
         x_coords = torch.linspace(-1, 1, W, device=x.device, dtype=x.dtype)
-        
-        # Expand to (1, 1, H, W) and (1, 1, H, W)
         y_grid = y_coords.view(1, 1, H, 1).expand(B, 1, H, W)
         x_grid = x_coords.view(1, 1, 1, W).expand(B, 1, H, W)
-        
         return torch.cat([x, x_grid, y_grid], dim=1)
 
 
 class CoordConv(nn.Module):
-    """CoordConv = AddCoords + Standard Conv2d.
-    
-    Liu et al., 2018 — "An Intriguing Failing of Convolutional Neural Networks
-    and the CoordConv Solution". Particularly effective for:
-    - Coordinate transforms (which we need: pixel position → class label)
-    - Training from scratch (no pretrained spatial priors)
-    """
+    """CoordConv = AddCoords + Standard Conv2d."""
     
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1,
                  padding=1, bias=False):
@@ -83,22 +65,9 @@ class CoordConv(nn.Module):
 # =============================================================================
 
 class SqueezeExcite(nn.Module):
-    """Squeeze-and-Excitation channel attention block.
-    
-    Learns to recalibrate channel-wise feature responses.
-    In decoder: suppresses irrelevant skip-connection channels
-    (e.g., building texture features when predicting road).
-    
-    Only adds ~2*C parameters per block — negligible cost.
-    """
+    """Squeeze-and-Excitation channel attention block."""
     
     def __init__(self, channels, reduction=4):
-        """Initialize SE block.
-        
-        Args:
-            channels: Number of input/output channels.
-            reduction: Channel reduction ratio for bottleneck.
-        """
         super().__init__()
         mid = max(channels // reduction, 8)
         self.fc = nn.Sequential(
@@ -111,16 +80,99 @@ class SqueezeExcite(nn.Module):
         )
     
     def forward(self, x):
-        """Apply channel attention.
-        
-        Args:
-            x: Input tensor (N, C, H, W).
-            
-        Returns:
-            Channel-recalibrated tensor (N, C, H, W).
-        """
         scale = self.fc(x).view(x.size(0), x.size(1), 1, 1)
         return x * scale
+
+
+# =============================================================================
+# REFLECTION ATTENTION UNIT (RAU) — water puddle detection
+# =============================================================================
+
+class ReflectionAttentionUnit(nn.Module):
+    """Reflection Attention Unit for detecting water puddles and reflective surfaces.
+
+    From: Han et al., "Single Image Water Hazard Detection using FCN with
+    Reflection Attention Units", ECCV 2018.
+
+    Core insight: a water puddle on the road reflects the sky above it.
+    This creates a specific vertical relationship in the feature space —
+    a ground-level pixel that looks like sky is almost certainly a reflection.
+
+    Mechanism:
+        1. Vertically flip the feature map. This aligns each ground pixel
+           with the sky pixel it would reflect if the surface were a mirror.
+        2. Concatenate original + flipped features channel-wise.
+        3. A small conv network learns to detect where these two streams
+           match (i.e., where ground looks like sky = reflection = puddle).
+        4. The resulting spatial attention map suppresses reflective pixels
+           so the decoder classifies them correctly as road surface, not sky.
+
+    Gated residual design:
+        output = x + tanh(gate) * refined_attended_features
+        gate initialised to 0 → tanh(0) = 0 → identity at epoch 0.
+        The gate gradually opens as training progresses, so the RAU cannot
+        destabilise early training. Safe for from-scratch training.
+
+    Where it lives: between encoder stage5 and stage6 (1/16 resolution,
+    96 channels in student / 128 in teacher). Deep enough for semantic
+    sky/ground understanding, before final feature compression.
+
+    Args:
+        channels: Number of input/output feature channels.
+        reduction: Channel reduction for the cross-attention bottleneck.
+    """
+
+    def __init__(self, channels, reduction=8):
+        super().__init__()
+        mid = max(channels // reduction, 16)
+
+        # Cross-attention branch: detects vertical sky-ground correspondence.
+        # Input: [original | vertically_flipped] → 2*channels
+        # Output: spatial attention map in [0, 1]
+        self.cross_attn = nn.Sequential(
+            nn.Conv2d(channels * 2, mid, kernel_size=1, bias=False),
+            nn.BatchNorm2d(mid),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, 1, kernel_size=1, bias=False),
+            nn.Sigmoid(),
+        )
+
+        # Refinement: processes attended features before gated residual add.
+        self.refine = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+        )
+
+        # Learnable gate scalar — initialised to 0 (identity at start of training).
+        # tanh keeps it bounded in (-1, 1) so the residual never explodes.
+        self.gate = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        """Apply reflection attention.
+
+        Args:
+            x: Feature map (N, C, H, W) from encoder deep context path.
+
+        Returns:
+            Attended feature map (N, C, H, W), same shape as input.
+        """
+        # Step 1: vertically flip — aligns ground pixels with the sky they reflect
+        x_flip = torch.flip(x, dims=[2])
+
+        # Step 2: cross-attention from vertical correlation
+        concat = torch.cat([x, x_flip], dim=1)   # (N, 2C, H, W)
+        attn = self.cross_attn(concat)             # (N, 1, H, W) in [0, 1]
+
+        # Step 3: suppress reflective pixels, refine
+        attended = x * attn
+        refined   = self.refine(attended)
+
+        # Step 4: gated residual — gate=0 → identity at init, opens during training
+        return x + torch.tanh(self.gate) * refined
 
 
 # =============================================================================
@@ -128,25 +180,10 @@ class SqueezeExcite(nn.Module):
 # =============================================================================
 
 class ConvBNReLU(nn.Module):
-    """Standard Convolution → BatchNorm → ReLU6 block.
-    
-    ReLU6 clips activations at 6, which is more robust for
-    quantization and mobile deployment.
-    """
+    """Standard Convolution → BatchNorm → ReLU6 block."""
     
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1,
                  padding=1, dilation=1, groups=1):
-        """Initialize ConvBNReLU block.
-        
-        Args:
-            in_channels: Number of input channels.
-            out_channels: Number of output channels.
-            kernel_size: Convolution kernel size.
-            stride: Convolution stride.
-            padding: Convolution padding.
-            dilation: Convolution dilation rate.
-            groups: Number of groups for grouped convolution.
-        """
         super().__init__()
         self.conv = nn.Conv2d(
             in_channels, out_channels, kernel_size,
@@ -157,59 +194,31 @@ class ConvBNReLU(nn.Module):
         self.relu = nn.ReLU6(inplace=True)
     
     def forward(self, x):
-        """Forward pass."""
         return self.relu(self.bn(self.conv(x)))
 
 
 class InvertedResidualBlock(nn.Module):
-    """MobileNetV2 Inverted Residual Block.
-    
-    Architecture:
-        Input (narrow) → 1×1 Expand → 3×3 Depthwise → 1×1 Project (narrow)
-        
-    The 'inverted' aspect: expands channels first, then compresses.
-    Uses residual connection only when input/output channels match and stride=1.
-    
-    Depthwise separable convolution = depthwise conv + pointwise conv
-    This reduces computation by ~k² factor compared to standard convolution
-    (where k is kernel size).
-    """
+    """MobileNetV2 Inverted Residual Block."""
     
     def __init__(self, in_channels, out_channels, stride=1, expand_ratio=6):
-        """Initialize InvertedResidualBlock.
-        
-        Args:
-            in_channels: Number of input channels.
-            out_channels: Number of output channels.
-            stride: Stride for the depthwise convolution (1 or 2).
-            expand_ratio: Expansion factor for the hidden dimension.
-        """
         super().__init__()
         self.use_residual = (stride == 1 and in_channels == out_channels)
         hidden_dim = in_channels * expand_ratio
         
         layers = []
-        
-        # 1×1 pointwise expansion (skip if expand_ratio == 1)
         if expand_ratio != 1:
             layers.append(ConvBNReLU(in_channels, hidden_dim, kernel_size=1, padding=0))
-        
-        # 3×3 depthwise convolution (groups=hidden_dim makes it depthwise)
         layers.append(ConvBNReLU(
             hidden_dim, hidden_dim, kernel_size=3, stride=stride,
             padding=1, groups=hidden_dim
         ))
-        
-        # 1×1 pointwise projection (linear — no ReLU to preserve info)
         layers.extend([
             nn.Conv2d(hidden_dim, out_channels, 1, bias=False),
             nn.BatchNorm2d(out_channels),
         ])
-        
         self.block = nn.Sequential(*layers)
     
     def forward(self, x):
-        """Forward pass with optional residual connection."""
         if self.use_residual:
             return x + self.block(x)
         return self.block(x)
@@ -220,65 +229,53 @@ class InvertedResidualBlock(nn.Module):
 # =============================================================================
 
 class MobileNetV2Encoder(nn.Module):
-    """Custom MobileNetV2-style encoder built from scratch.
-    
-    Progressively downsamples the input through inverted residual blocks,
-    producing feature maps at 1/2, 1/4, 1/8, and 1/16 resolution.
-    
-    Uses CoordConv at the stem to inject spatial position awareness.
-    
-    Channel widths are reduced compared to standard MobileNetV2
-    to keep total model under 3M parameters.
-    
-    Skip connections are extracted at 1/4, 1/8, and 1/16 for the decoder.
+    """Custom MobileNetV2-style encoder with CoordConv stem and RAU.
+
+    RAU is inserted between stage5 and stage6 — the deep context path
+    at 1/16 resolution where semantic sky/ground features are richest.
     """
     
     def __init__(self, in_channels=3):
-        """Initialize encoder.
-        
-        Args:
-            in_channels: Number of input image channels (3 for RGB).
-        """
         super().__init__()
         
         # CoordConv stem: RGB + (x, y) → 32 channels, stride 2 (1/2 resolution)
-        # CoordConv adds 2 coordinate channels, so input is in_channels + 2
         self.coord_conv = CoordConv(in_channels, 32, kernel_size=3, stride=2, padding=1)
-        self.stem_bn = nn.BatchNorm2d(32)
-        self.stem_relu = nn.ReLU6(inplace=True)
+        self.stem_bn    = nn.BatchNorm2d(32)
+        self.stem_relu  = nn.ReLU6(inplace=True)
         
-        # Stage 1: 32 → 16, stride 1 (still 1/2 resolution)
         self.stage1 = InvertedResidualBlock(32, 16, stride=1, expand_ratio=1)
         
-        # Stage 2: 16 → 24, stride 2 (1/4 resolution) — SKIP CONNECTION
+        # 1/4 resolution — SKIP CONNECTION
         self.stage2 = nn.Sequential(
             InvertedResidualBlock(16, 24, stride=2, expand_ratio=6),
             InvertedResidualBlock(24, 24, stride=1, expand_ratio=6),
         )
         
-        # Stage 3: 24 → 32, stride 2 (1/8 resolution) — SKIP CONNECTION
+        # 1/8 resolution — SKIP CONNECTION
         self.stage3 = nn.Sequential(
             InvertedResidualBlock(24, 32, stride=2, expand_ratio=6),
             InvertedResidualBlock(32, 32, stride=1, expand_ratio=6),
             InvertedResidualBlock(32, 32, stride=1, expand_ratio=6),
         )
         
-        # Stage 4: 32 → 64, stride 2 (1/16 resolution)
+        # 1/16 resolution
         self.stage4 = nn.Sequential(
             InvertedResidualBlock(32, 64, stride=2, expand_ratio=6),
             InvertedResidualBlock(64, 64, stride=1, expand_ratio=6),
             InvertedResidualBlock(64, 64, stride=1, expand_ratio=6),
             InvertedResidualBlock(64, 64, stride=1, expand_ratio=6),
         )
-        
-        # Stage 5: 64 → 96, stride 1 (still 1/16 resolution) — feeds into ASPP
         self.stage5 = nn.Sequential(
             InvertedResidualBlock(64, 96, stride=1, expand_ratio=6),
             InvertedResidualBlock(96, 96, stride=1, expand_ratio=6),
             InvertedResidualBlock(96, 96, stride=1, expand_ratio=6),
         )
-        
-        # Stage 6: 96 → 160, stride 1 (still 1/16 resolution) — final features
+
+        # RAU inserted here: 96-channel features at 1/16 resolution.
+        # Deep enough for sky/road semantic understanding.
+        # Safe: gated residual starts as identity (gate=0).
+        self.rau = ReflectionAttentionUnit(channels=96, reduction=8)
+
         self.stage6 = nn.Sequential(
             InvertedResidualBlock(96, 160, stride=1, expand_ratio=6),
             InvertedResidualBlock(160, 160, stride=1, expand_ratio=6),
@@ -286,30 +283,27 @@ class MobileNetV2Encoder(nn.Module):
     
     def forward(self, x):
         """Forward pass returning multi-scale features for skip connections.
-        
-        Args:
-            x: Input tensor (N, 3, H, W).
-            
+
         Returns:
-            Tuple of (skip_4x, skip_8x, features_16x) tensors:
-            - skip_4x: Features at 1/4 resolution (24 channels)
-            - skip_8x: Features at 1/8 resolution (32 channels)
-            - features_16x: Features at 1/16 resolution (160 channels)
+            (skip_4x, skip_8x, features_16x):
+            - skip_4x:       (N, 24,  H/4,  W/4)
+            - skip_8x:       (N, 32,  H/8,  W/8)
+            - features_16x:  (N, 160, H/16, W/16)
         """
-        # CoordConv stem (position-aware)
         x = self.stem_relu(self.stem_bn(self.coord_conv(x)))  # 1/2
         x = self.stage1(x)    # 1/2
-        
+
         x = self.stage2(x)    # 1/4
-        skip_4x = x           # Save for decoder
-        
+        skip_4x = x
+
         x = self.stage3(x)    # 1/8
-        skip_8x = x           # Save for decoder
-        
+        skip_8x = x
+
         x = self.stage4(x)    # 1/16
         x = self.stage5(x)    # 1/16
+        x = self.rau(x)       # 1/16 — reflection attention (water puddles)
         x = self.stage6(x)    # 1/16
-        
+
         return skip_4x, skip_8x, x
 
 
@@ -318,84 +312,32 @@ class MobileNetV2Encoder(nn.Module):
 # =============================================================================
 
 class LightweightASPP(nn.Module):
-    """Lightweight Atrous Spatial Pyramid Pooling module.
-    
-    Captures multi-scale context using parallel dilated convolutions
-    with different dilation rates: 6, 12, 18.
-    
-    Also includes:
-    - 1×1 convolution for local features
-    - Global average pooling for image-level features
-    
-    All branches are concatenated and fused through a 1×1 convolution.
-    """
+    """Lightweight Atrous Spatial Pyramid Pooling module."""
     
     def __init__(self, in_channels=160, out_channels=128):
-        """Initialize ASPP module.
-        
-        Args:
-            in_channels: Number of input feature channels.
-            out_channels: Number of output channels.
-        """
         super().__init__()
-        
-        # Branch 1: 1×1 convolution (local features)
-        self.conv1x1 = ConvBNReLU(in_channels, out_channels, kernel_size=1, padding=0)
-        
-        # Branch 2: 3×3 convolution with dilation=6 (medium context)
-        self.conv_d6 = ConvBNReLU(
-            in_channels, out_channels, kernel_size=3,
-            padding=6, dilation=6
-        )
-        
-        # Branch 3: 3×3 convolution with dilation=12 (large context)
-        self.conv_d12 = ConvBNReLU(
-            in_channels, out_channels, kernel_size=3,
-            padding=12, dilation=12
-        )
-        
-        # Branch 4: 3×3 convolution with dilation=18 (very large context)
-        self.conv_d18 = ConvBNReLU(
-            in_channels, out_channels, kernel_size=3,
-            padding=18, dilation=18
-        )
-        
-        # Branch 5: Global average pooling + 1×1 conv (image-level features)
+        self.conv1x1  = ConvBNReLU(in_channels, out_channels, kernel_size=1, padding=0)
+        self.conv_d6  = ConvBNReLU(in_channels, out_channels, kernel_size=3, padding=6,  dilation=6)
+        self.conv_d12 = ConvBNReLU(in_channels, out_channels, kernel_size=3, padding=12, dilation=12)
+        self.conv_d18 = ConvBNReLU(in_channels, out_channels, kernel_size=3, padding=18, dilation=18)
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
         self.global_conv = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
             nn.ReLU6(inplace=True),
         )
-        
-        # Fusion: concatenate all 5 branches → 1×1 conv to reduce channels
-        self.fuse = ConvBNReLU(out_channels * 5, out_channels, kernel_size=1, padding=0)
+        self.fuse    = ConvBNReLU(out_channels * 5, out_channels, kernel_size=1, padding=0)
         self.dropout = nn.Dropout2d(0.1)
     
     def forward(self, x):
-        """Forward pass through parallel ASPP branches.
-        
-        Args:
-            x: Input features (N, C, H, W).
-            
-        Returns:
-            Multi-scale fused features (N, out_channels, H, W).
-        """
         size = x.shape[2:]
-        
         b1 = self.conv1x1(x)
         b2 = self.conv_d6(x)
         b3 = self.conv_d12(x)
         b4 = self.conv_d18(x)
-        b5 = self.global_pool(x)
-        b5 = self.global_conv(b5)
+        b5 = self.global_conv(self.global_pool(x))
         b5 = F.interpolate(b5, size=size, mode='bilinear', align_corners=True)
-        
-        # Concatenate all branches
         out = torch.cat([b1, b2, b3, b4, b5], dim=1)
-        out = self.fuse(out)
-        out = self.dropout(out)
-        
-        return out
+        return self.dropout(self.fuse(out))
 
 
 # =============================================================================
@@ -403,90 +345,36 @@ class LightweightASPP(nn.Module):
 # =============================================================================
 
 class DecoderBlock(nn.Module):
-    """Single decoder block: upsample → concatenate skip → refine → SE attend.
-    
-    Uses bilinear upsampling (not transposed convolution) for efficiency
-    and to avoid checkerboard artifacts. SE attention recalibrates channels
-    after skip concatenation to suppress irrelevant encoder features.
-    """
+    """Single decoder block: upsample → concatenate skip → refine → SE attend."""
     
     def __init__(self, in_channels, skip_channels, out_channels):
-        """Initialize decoder block.
-        
-        Args:
-            in_channels: Channels from the previous decoder level (or ASPP).
-            skip_channels: Channels from the encoder skip connection.
-            out_channels: Number of output channels.
-        """
         super().__init__()
         self.refine = nn.Sequential(
             ConvBNReLU(in_channels + skip_channels, out_channels, kernel_size=3, padding=1),
             ConvBNReLU(out_channels, out_channels, kernel_size=3, padding=1),
         )
-        # Channel attention after refinement
-        self.se = SqueezeExcite(out_channels, reduction=4)
-        # Spatial dropout to reduce overfitting (only active during training)
+        self.se      = SqueezeExcite(out_channels, reduction=4)
         self.dropout = nn.Dropout2d(0.15)
     
     def forward(self, x, skip):
-        """Forward pass with skip connection and SE attention.
-        
-        Args:
-            x: Input features from previous level.
-            skip: Skip connection features from encoder.
-            
-        Returns:
-            Refined, attention-recalibrated features at 2× resolution.
-        """
-        # Upsample to match skip connection size
         x = F.interpolate(x, size=skip.shape[2:], mode='bilinear', align_corners=True)
-        # Concatenate with skip
         x = torch.cat([x, skip], dim=1)
-        # Refine
         x = self.refine(x)
-        # Channel attention
         x = self.se(x)
-        # Dropout for regularization
-        x = self.dropout(x)
-        return x
+        return self.dropout(x)
 
 
 class UNetDecoder(nn.Module):
-    """U-Net style decoder with bilinear upsampling, skip connections, and SE attention.
-    
-    Takes ASPP output (1/16 resolution) and progressively upsamples
-    using skip connections from the encoder at 1/8 and 1/4 resolution.
-    """
+    """U-Net style decoder with bilinear upsampling, skip connections, and SE attention."""
     
     def __init__(self, aspp_channels=128, skip_8x_channels=32, skip_4x_channels=24):
-        """Initialize U-Net decoder.
-        
-        Args:
-            aspp_channels: Channels from ASPP output.
-            skip_8x_channels: Channels from encoder 1/8 skip.
-            skip_4x_channels: Channels from encoder 1/4 skip.
-        """
         super().__init__()
-        
-        # 1/16 → 1/8 (with 32-channel skip from encoder stage3)
         self.decode_8x = DecoderBlock(aspp_channels, skip_8x_channels, 64)
-        
-        # 1/8 → 1/4 (with 24-channel skip from encoder stage2)
         self.decode_4x = DecoderBlock(64, skip_4x_channels, 32)
     
     def forward(self, aspp_out, skip_8x, skip_4x):
-        """Forward pass through decoder.
-        
-        Args:
-            aspp_out: ASPP output at 1/16 resolution.
-            skip_8x: Encoder features at 1/8 resolution.
-            skip_4x: Encoder features at 1/4 resolution.
-            
-        Returns:
-            Decoded features at 1/4 resolution (32 channels).
-        """
-        x = self.decode_8x(aspp_out, skip_8x)  # 1/16 → 1/8
-        x = self.decode_4x(x, skip_4x)          # 1/8 → 1/4
+        x = self.decode_8x(aspp_out, skip_8x)
+        x = self.decode_4x(x, skip_4x)
         return x
 
 
@@ -496,52 +384,38 @@ class UNetDecoder(nn.Module):
 
 class LiteSegNet(nn.Module):
     """LiteSeg: Complete lightweight segmentation network.
-    
+
     Architecture:
-        Input → CoordConv Stem → MobileNetV2 Encoder → ASPP → 
-        U-Net Decoder (with SE attention) → Segmentation Head
-        
-    Produces binary drivable/non-drivable segmentation.
-    
-    IMPORTANT: forward() returns RAW LOGITS (not sigmoid).
-    Use predict() for inference with sigmoid applied.
-    
-    Target: <3M parameters, real-time inference.
+        Input
+        → CoordConv Stem      (position-aware, no pretrained weights needed)
+        → MobileNetV2 Stages 1-5
+        → RAU                 (reflection attention — water puddle handling)
+        → MobileNetV2 Stage 6
+        → ASPP                (multi-scale context)
+        → U-Net Decoder       (skip connections + SE channel attention)
+        → Segmentation Head
+        → Raw logits
+
+    IMPORTANT: forward() returns RAW LOGITS — no sigmoid.
+    Apply sigmoid externally (in loss/metric functions) for numerical stability.
+    Use predict() for inference.
     """
     
     def __init__(self, in_channels=3, num_classes=1):
-        """Initialize LiteSeg model.
-        
-        Args:
-            in_channels: Input image channels (3 for RGB).
-            num_classes: Number of output classes (1 for binary segmentation).
-        """
         super().__init__()
-        
-        self.encoder = MobileNetV2Encoder(in_channels)
-        self.aspp = LightweightASPP(in_channels=160, out_channels=128)
-        self.decoder = UNetDecoder(
-            aspp_channels=128,
-            skip_8x_channels=32,
-            skip_4x_channels=24
-        )
-        
-        # Final segmentation head: 1×1 conv to produce logits
+        self.encoder  = MobileNetV2Encoder(in_channels)
+        self.aspp     = LightweightASPP(in_channels=160, out_channels=128)
+        self.decoder  = UNetDecoder(aspp_channels=128, skip_8x_channels=32, skip_4x_channels=24)
         self.seg_head = nn.Sequential(
             ConvBNReLU(32, 16, kernel_size=3, padding=1),
             nn.Conv2d(16, num_classes, kernel_size=1),
         )
-        
-        # Initialize weights
+        # Auxiliary boundary head — taps from same 32-ch decoder features.
+        # Predicts drivable area edges for explicit boundary supervision.
+        self.boundary_head = nn.Conv2d(32, 1, kernel_size=1)
         self._init_weights()
     
     def _init_weights(self):
-        """Initialize model weights using Kaiming initialization.
-        
-        - fan_in mode: correct for layers followed by ReLU/ReLU6
-        - Final conv bias initialized to prior that most pixels are non-drivable
-          (prevents the model from starting by predicting everything as road)
-        """
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
@@ -554,55 +428,38 @@ class LiteSegNet(nn.Module):
                 nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        
-        # Initialize final conv bias to prior: ~30% of pixels are drivable
-        # bias = -log((1 - prior) / prior) = -log(0.7 / 0.3) ≈ -0.847
-        # This ensures the model starts by predicting "mostly non-drivable"
+        # Prior: ~30% of pixels are drivable → bias = -log(0.7/0.3) ≈ -0.847
         final_conv = self.seg_head[-1]
         if final_conv.bias is not None:
             nn.init.constant_(final_conv.bias, -0.847)
+        # Boundary head: ~10% of pixels are boundary → bias = -log(0.9/0.1) ≈ -2.2
+        nn.init.constant_(self.boundary_head.bias, -2.2)
+        # RAU gate explicitly zero (already default, but be explicit)
+        nn.init.zeros_(self.encoder.rau.gate)
     
     def forward(self, x):
-        """Forward pass through complete LiteSeg network.
+        """Forward pass.
         
-        RETURNS RAW LOGITS — no sigmoid applied.
-        Use predict() for inference.
-        
-        Args:
-            x: Input tensor (N, 3, H, W).
-            
-        Returns:
-            Raw logits (N, 1, H, W). Apply sigmoid externally for probabilities.
+        Training:  returns (seg_logits, boundary_logits) — both (N, 1, H, W).
+        Eval:      returns seg_logits only (N, 1, H, W) — backward compatible.
         """
-        input_size = x.shape[2:]
-        
-        # Encoder with skip connections (CoordConv at stem)
+        input_size          = x.shape[2:]
         skip_4x, skip_8x, features = self.encoder(x)
+        aspp_out            = self.aspp(features)
+        decoded             = self.decoder(aspp_out, skip_8x, skip_4x)
+        decoded             = F.interpolate(decoded, size=input_size, mode='bilinear', align_corners=True)
+        seg_logits = self.seg_head(decoded)
         
-        # ASPP for multi-scale context
-        aspp_out = self.aspp(features)
-        
-        # Decoder with skip connections and SE attention
-        decoded = self.decoder(aspp_out, skip_8x, skip_4x)
-        
-        # Upsample from 1/4 to full resolution
-        decoded = F.interpolate(decoded, size=input_size, mode='bilinear', align_corners=True)
-        
-        # Segmentation head → raw logits
-        logits = self.seg_head(decoded)
-        
-        return logits
+        if self.training:
+            boundary_logits = self.boundary_head(decoded)
+            return seg_logits, boundary_logits
+        return seg_logits
     
     def predict(self, x):
-        """Inference-time forward pass with sigmoid.
-        
-        Args:
-            x: Input tensor (N, 3, H, W).
-            
-        Returns:
-            Segmentation probabilities (N, 1, H, W) via sigmoid.
-        """
-        return torch.sigmoid(self.forward(x))
+        """Inference: returns sigmoid probabilities (N, 1, H, W)."""
+        self.eval()
+        with torch.no_grad():
+            return torch.sigmoid(self.forward(x))
 
 
 # =============================================================================
@@ -611,27 +468,18 @@ class LiteSegNet(nn.Module):
 
 class LiteSegTeacher(nn.Module):
     """Larger teacher model (~5M params) for knowledge distillation.
-    
-    Same architecture as LiteSegNet but with wider channels
-    throughout the encoder and decoder to increase capacity.
-    
-    Also uses CoordConv stem and SE attention in decoder.
-    Returns raw logits; use predict() for inference.
+
+    Identical structure to LiteSegNet but wider channels.
+    RAU inserted at equivalent position: between stage5 and stage6
+    at 128-channel, 1/16 resolution features.
     """
     
     def __init__(self, in_channels=3, num_classes=1):
-        """Initialize teacher model with wider channels.
-        
-        Args:
-            in_channels: Input image channels.
-            num_classes: Number of output classes.
-        """
         super().__init__()
         
-        # CoordConv stem (wider)
         self.coord_conv = CoordConv(in_channels, 48, kernel_size=3, stride=2, padding=1)
-        self.stem_bn = nn.BatchNorm2d(48)
-        self.stem_relu = nn.ReLU6(inplace=True)
+        self.stem_bn    = nn.BatchNorm2d(48)
+        self.stem_relu  = nn.ReLU6(inplace=True)
         
         self.stage1 = InvertedResidualBlock(48, 24, stride=1, expand_ratio=1)
         self.stage2 = nn.Sequential(
@@ -657,29 +505,28 @@ class LiteSegTeacher(nn.Module):
             InvertedResidualBlock(128, 128, stride=1, expand_ratio=6),
             InvertedResidualBlock(128, 128, stride=1, expand_ratio=6),
         )
+
+        # RAU at 128 channels — same position as student
+        self.rau = ReflectionAttentionUnit(channels=128, reduction=8)
+
         self.stage6 = nn.Sequential(
             InvertedResidualBlock(128, 224, stride=1, expand_ratio=6),
             InvertedResidualBlock(224, 224, stride=1, expand_ratio=6),
             InvertedResidualBlock(224, 224, stride=1, expand_ratio=6),
         )
         
-        # Wider ASPP
-        self.aspp = LightweightASPP(in_channels=224, out_channels=192)
-        
-        # Wider decoder with SE attention
+        self.aspp     = LightweightASPP(in_channels=224, out_channels=192)
         self.decode_8x = DecoderBlock(192, 48, 96)
         self.decode_4x = DecoderBlock(96, 32, 48)
-        
-        # Segmentation head
         self.seg_head = nn.Sequential(
             ConvBNReLU(48, 24, kernel_size=3, padding=1),
             nn.Conv2d(24, num_classes, kernel_size=1),
         )
-        
+        # Auxiliary boundary head — same design as student
+        self.boundary_head = nn.Conv2d(48, 1, kernel_size=1)
         self._init_weights()
     
     def _init_weights(self):
-        """Initialize weights with Kaiming initialization."""
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
@@ -692,54 +539,39 @@ class LiteSegTeacher(nn.Module):
                 nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        
-        # Prior: most pixels are non-drivable
         final_conv = self.seg_head[-1]
         if final_conv.bias is not None:
             nn.init.constant_(final_conv.bias, -0.847)
+        nn.init.constant_(self.boundary_head.bias, -2.2)
+        nn.init.zeros_(self.rau.gate)
     
     def forward(self, x):
-        """Forward pass through teacher model.
-        
-        Returns raw logits.
-        
-        Args:
-            x: Input tensor (N, 3, H, W).
-            
-        Returns:
-            Raw logits (N, 1, H, W).
-        """
+        """Training: returns (seg_logits, boundary_logits). Eval: seg_logits only."""
         input_size = x.shape[2:]
-        
         x = self.stem_relu(self.stem_bn(self.coord_conv(x)))
         x = self.stage1(x)
-        x = self.stage2(x)
-        skip_4x = x
-        x = self.stage3(x)
-        skip_8x = x
+        x = self.stage2(x);  skip_4x = x
+        x = self.stage3(x);  skip_8x = x
         x = self.stage4(x)
         x = self.stage5(x)
+        x = self.rau(x)       # reflection attention
         x = self.stage6(x)
-        
         aspp_out = self.aspp(x)
         x = self.decode_8x(aspp_out, skip_8x)
         x = self.decode_4x(x, skip_4x)
-        
         x = F.interpolate(x, size=input_size, mode='bilinear', align_corners=True)
-        logits = self.seg_head(x)
+        seg_logits = self.seg_head(x)
         
-        return logits
+        if self.training:
+            boundary_logits = self.boundary_head(x)
+            return seg_logits, boundary_logits
+        return seg_logits
     
     def predict(self, x):
-        """Inference-time forward pass with sigmoid.
-        
-        Args:
-            x: Input tensor (N, 3, H, W).
-            
-        Returns:
-            Segmentation probabilities (N, 1, H, W).
-        """
-        return torch.sigmoid(self.forward(x))
+        """Inference: returns sigmoid probabilities (N, 1, H, W)."""
+        self.eval()
+        with torch.no_grad():
+            return torch.sigmoid(self.forward(x))
 
 
 # =============================================================================
@@ -747,37 +579,33 @@ class LiteSegTeacher(nn.Module):
 # =============================================================================
 
 def get_model_info(model, input_size=(1, 3, 256, 448)):
-    """Print model information including parameter count and output shape.
-    
-    Args:
-        model: PyTorch model.
-        input_size: Input tensor size for forward pass test.
-    """
-    total_params = sum(p.numel() for p in model.parameters())
+    total_params     = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    
     print(f"{'='*50}")
     print(f"Model: {model.__class__.__name__}")
     print(f"Total Parameters: {total_params:,}")
     print(f"Trainable Parameters: {trainable_params:,}")
     print(f"Parameters (M): {total_params / 1e6:.2f}M")
     print(f"Under 3M: {'✓ YES' if total_params < 3_000_000 else '✗ NO'}")
-    
-    # Test forward pass
     device = next(model.parameters()).device
-    dummy = torch.randn(*input_size).to(device)
+    dummy  = torch.randn(*input_size).to(device)
+    model.eval()
     with torch.no_grad():
         output = model(dummy)
-    print(f"Input shape:  {list(dummy.shape)}")
-    print(f"Output shape: {list(output.shape)}")
-    print(f"Output range: [{output.min().item():.3f}, {output.max().item():.3f}] (logits)")
+    if isinstance(output, tuple):
+        seg, boundary = output
+        print(f"Input shape:     {list(dummy.shape)}")
+        print(f"Seg output:      {list(seg.shape)}")
+        print(f"Boundary output: {list(boundary.shape)}")
+    else:
+        print(f"Input shape:  {list(dummy.shape)}")
+        print(f"Output shape: {list(output.shape)}")
+        print(f"Output range: [{output.min().item():.3f}, {output.max().item():.3f}] (logits)")
     print(f"{'='*50}")
-    
     return total_params
 
 
 if __name__ == '__main__':
-    # Test both models
     print("\n--- Student Model (LiteSegNet) ---")
     student = LiteSegNet()
     get_model_info(student)

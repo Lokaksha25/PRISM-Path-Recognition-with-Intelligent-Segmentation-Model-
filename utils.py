@@ -263,6 +263,40 @@ class SpatialPriorLoss(nn.Module):
         return (sky_probs ** 2).mean() * self.penalty_weight
 
 
+class BoundaryHeadLoss(nn.Module):
+    """Loss for the auxiliary boundary prediction head.
+    
+    Generates boundary ground truth by extracting edges from the segmentation
+    mask using morphological dilation/erosion, then supervises the boundary
+    head output with binary cross-entropy.
+    
+    This gives the model an explicit signal for edge sharpness without
+    coupling boundary quality to the main segmentation loss.
+    """
+    
+    def __init__(self, kernel_size=5):
+        super().__init__()
+        self.kernel_size = kernel_size
+    
+    def _get_boundary_gt(self, target):
+        """Extract boundary band from binary target mask."""
+        k = self.kernel_size
+        p = k // 2
+        dilated = F.max_pool2d(target, k, stride=1, padding=p)
+        eroded = -F.max_pool2d(-target, k, stride=1, padding=p)
+        return (dilated - eroded).clamp(0, 1)
+    
+    def forward(self, boundary_logits, target):
+        """Compute boundary head loss.
+        
+        Args:
+            boundary_logits: Boundary head output (N, 1, H, W) — raw logits.
+            target: Segmentation GT mask (N, 1, H, W).
+        """
+        boundary_gt = self._get_boundary_gt(target)
+        return F.binary_cross_entropy_with_logits(boundary_logits, boundary_gt)
+
+
 class PRISMLossV2(nn.Module):
     """PRISM Loss V2 — Combined loss for false-positive-aware segmentation.
     
@@ -275,9 +309,10 @@ class PRISMLossV2(nn.Module):
     All operate on raw logits for numerical stability.
     """
     
-    def __init__(self, w_focal=0.4, w_tversky=0.3, w_boundary=0.15, w_spatial=0.15,
-                 focal_alpha=0.25, focal_gamma=2.0,
-                 tversky_alpha=0.7, tversky_beta=0.3):
+    def __init__(self, w_focal=0.3, w_tversky=0.4, w_boundary=0.15, w_spatial=0.15,
+                 w_boundary_head=0.1,
+                 focal_alpha=0.75, focal_gamma=2.0,
+                 tversky_alpha=0.3, tversky_beta=0.7):
         """Initialize PRISMLossV2.
         
         Args:
@@ -285,6 +320,7 @@ class PRISMLossV2(nn.Module):
             w_tversky: Weight for Tversky loss component.
             w_boundary: Weight for multi-scale boundary loss component.
             w_spatial: Weight for spatial prior loss component.
+            w_boundary_head: Weight for auxiliary boundary head loss.
             focal_alpha: Alpha for focal loss (positive class weight).
             focal_gamma: Gamma for focal loss (focusing parameter).
             tversky_alpha: Alpha for Tversky (FP weight). Higher = more FP penalty.
@@ -295,18 +331,21 @@ class PRISMLossV2(nn.Module):
         self.w_tversky = w_tversky
         self.w_boundary = w_boundary
         self.w_spatial = w_spatial
+        self.w_boundary_head = w_boundary_head
         
         self.focal = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
         self.tversky = TverskyLoss(alpha=tversky_alpha, beta=tversky_beta)
         self.boundary = MultiScaleBoundaryLoss(kernel_sizes=(3, 5, 9), boundary_weight=3.0)
         self.spatial = SpatialPriorLoss(sky_fraction=0.35, penalty_weight=2.0)
+        self.boundary_head_loss = BoundaryHeadLoss(kernel_size=5)
     
-    def forward(self, logits, target):
+    def forward(self, logits, target, boundary_logits=None):
         """Compute combined PRISM loss.
         
         Args:
-            logits: Raw model output (N, 1, H, W).
+            logits: Raw seg output (N, 1, H, W).
             target: Ground truth binary mask (N, 1, H, W).
+            boundary_logits: Optional boundary head output (N, 1, H, W).
             
         Returns:
             Scalar combined loss.
@@ -316,10 +355,17 @@ class PRISMLossV2(nn.Module):
         loss_boundary = self.boundary(logits, target)
         loss_spatial = self.spatial(logits, target)
         
-        return (self.w_focal * loss_focal + 
-                self.w_tversky * loss_tversky + 
-                self.w_boundary * loss_boundary +
-                self.w_spatial * loss_spatial)
+        total = (self.w_focal * loss_focal + 
+                 self.w_tversky * loss_tversky + 
+                 self.w_boundary * loss_boundary +
+                 self.w_spatial * loss_spatial)
+        
+        # Add boundary head loss if provided
+        if boundary_logits is not None:
+            loss_bh = self.boundary_head_loss(boundary_logits, target)
+            total = total + self.w_boundary_head * loss_bh
+        
+        return total
 
 
 # =============================================================================

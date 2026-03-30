@@ -1,758 +1,559 @@
 """
-generate_masks.py — Generate drivable area masks from nuScenes BEV maps.
+generate_masks.py — Generate drivable area masks from nuScenes bitmap maps.
+
+Uses the raw semantic_prior bitmap PNGs (binary: 0=non-drivable, 255=drivable)
+with auto-calibrated coordinate mapping. The calibration works by finding the
+pixel offset that places ego vehicle positions on drivable (white) pixels —
+since the vehicle drives on roads, this is guaranteed to be correct.
 
 Pipeline:
-1. Load BEV raster map for each scene's location
-2. For each CAM_FRONT keyframe, get ego_pose and calibrated_sensor data
-3. Extract local BEV patch around ego vehicle position
-4. Project ground plane points to camera image using intrinsics/extrinsics
-5. Generate binary drivable mask at camera resolution
-6. Save masks as PNGs
+1. Load raw bitmap maps (one per location)
+2. Auto-calibrate pixel↔world mapping using ego poses as ground truth
+3. For each CAM_FRONT keyframe:
+   a. Create dense ground-plane grid around the ego vehicle
+   b. Look up each grid point in the calibrated bitmap
+   c. Project drivable points to camera image
+   d. Fill gaps with morphological closing
+4. Save masks as PNGs
 
 Usage:
-    python generate_masks.py --dataroot ./  --output_dir masks --visualize 5
+    python generate_masks.py --dataroot ./ --output_dir masks --visualize 10
 """
 
 import os
+
+# Allow loading very large bitmaps — must be set BEFORE importing cv2
+os.environ["OPENCV_IO_MAX_IMAGE_PIXELS"] = str(2**40)
+
 import json
 import argparse
 import numpy as np
 import cv2
-from pathlib import Path
 from pyquaternion import Quaternion
 from tqdm import tqdm
 
 
+# =============================================================================
+# UTILITIES
+# =============================================================================
+
 def load_table(dataroot, table_name):
-    """Load a nuScenes metadata table from JSON.
-    
-    Args:
-        dataroot: Root directory containing v1.0-mini/.
-        table_name: Name of the JSON file (e.g., 'scene.json').
-        
-    Returns:
-        List of dictionaries from the JSON file.
-    """
-    path = os.path.join(dataroot, "v1.0-mini", table_name)
-    with open(path, "r") as f:
+    """Load a nuScenes metadata table from JSON."""
+    with open(os.path.join(dataroot, "v1.0-mini", table_name), "r") as f:
         return json.load(f)
 
 
 def build_token_map(table):
-    """Build a token→record lookup dictionary for fast access.
-    
-    Args:
-        table: List of records (dicts), each with a 'token' key.
-        
-    Returns:
-        Dict mapping token string to record dict.
-    """
-    return {record['token']: record for record in table}
+    """Build token→record lookup dict."""
+    return {r['token']: r for r in table}
 
 
 def get_transform_matrix(translation, rotation):
-    """Build a 4×4 homogeneous transformation matrix.
-    
-    Args:
-        translation: List of 3 floats [x, y, z].
-        rotation: List of 4 floats [w, x, y, z] (quaternion).
-        
-    Returns:
-        4×4 numpy array transformation matrix.
-    """
+    """Build 4×4 homogeneous transform from translation + quaternion."""
     T = np.eye(4)
     T[:3, :3] = Quaternion(rotation).rotation_matrix
     T[:3, 3] = translation
     return T
 
 
-def load_bev_map(dataroot, map_filename):
-    """Load and process BEV (Bird's Eye View) raster map.
-    
-    The nuScenes semantic_prior maps encode different classes as different
-    pixel intensities. The drivable area appears as a distinct intensity
-    in the map.
-    
-    Args:
-        dataroot: Root directory.
-        map_filename: Relative path to map PNG.
-        
-    Returns:
-        Tuple of (full_map, drivable_mask) as numpy arrays.
-    """
-    map_path = os.path.join(dataroot, map_filename)
-    full_map = cv2.imread(map_path, cv2.IMREAD_UNCHANGED)
-    
-    if full_map is None:
-        raise FileNotFoundError(f"Could not load map: {map_path}")
-    
-    return full_map
+# =============================================================================
+# BITMAP MAP HANDLER
+# =============================================================================
 
-
-def extract_drivable_from_bev(bev_map, threshold_low=200, threshold_high=256):
-    """Extract drivable area from BEV raster map by intensity thresholding.
+class BitmapMap:
+    """Handles a single semantic_prior bitmap map with auto-calibrated coords.
     
-    The semantic prior maps in nuScenes use high intensity (white/near-white)
-    pixels to mark traversable road surfaces.
-    
-    Args:
-        bev_map: BEV map as numpy array.
-        threshold_low: Lower intensity threshold for drivable pixels.
-        threshold_high: Upper intensity threshold.
-        
-    Returns:
-        Binary drivable mask (same size as bev_map).
-    """
-    if len(bev_map.shape) == 3:
-        # Convert to grayscale if color
-        gray = cv2.cvtColor(bev_map, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = bev_map
-    
-    # Drivable areas are typically the brightest regions in semantic prior maps
-    drivable = (gray >= threshold_low).astype(np.uint8)
-    
-    return drivable
-
-
-class NuScenesMaskGenerator:
-    """Generates drivable area masks for CAM_FRONT images.
-    
-    Uses BEV raster maps, ego poses, and camera calibration data
-    to project drivable areas from the bird's eye view onto the
-    camera image plane.
+    The bitmap is binary (0 or 255). This class finds the correct
+    pixel↔world coordinate mapping by testing ego positions against the bitmap.
     """
     
-    # Map resolution in meters per pixel for nuScenes maps
-    # nuScenes maps: 10 pixels per meter, so 0.1 meters per pixel
-    MAP_RESOLUTION = 0.1  # meters/pixel
+    RESOLUTION = 0.1  # meters per pixel (standard nuScenes)
     
-    # BEV patch size around ego vehicle (in meters)
-    BEV_RANGE_FORWARD = 50.0   # meters ahead
-    BEV_RANGE_BEHIND = 10.0    # meters behind
-    BEV_RANGE_SIDE = 25.0      # meters left/right
-    
-    def __init__(self, dataroot):
-        """Initialize mask generator with nuScenes data.
+    def __init__(self, bitmap_path, ego_positions):
+        """Load bitmap and calibrate coordinate mapping.
         
         Args:
-            dataroot: Root directory of nuScenes dataset.
+            bitmap_path: Path to the semantic_prior PNG file.
+            ego_positions: List of (x, y) tuples of ego vehicle positions
+                          that MUST be on drivable (white) pixels.
         """
+        self.bitmap = cv2.imread(bitmap_path, cv2.IMREAD_GRAYSCALE)
+        if self.bitmap is None:
+            raise RuntimeError(f"Failed to load bitmap: {bitmap_path}")
+        
+        self.height, self.width = self.bitmap.shape
+        self.drivable = (self.bitmap >= 200).astype(np.uint8)
+        
+        print(f"  Bitmap shape: {self.bitmap.shape}")
+        print(f"  Drivable pixels: {self.drivable.sum()} ({self.drivable.sum()/self.drivable.size*100:.1f}%)")
+        
+        # Auto-calibrate
+        self.origin_x = 0.0  # world_x that maps to pixel col 0
+        self.origin_y = 0.0  # world_y that maps to pixel row 0
+        self._calibrate(ego_positions)
+    
+    def _calibrate(self, ego_positions):
+        """Find the origin offset that maximizes ego positions on drivable pixels.
+        
+        Since the ego vehicle drives on roads, the correct mapping will place
+        most/all ego positions on drivable (white) pixels in the bitmap.
+        
+        Strategy: Use resolution=0.1, search for (origin_x, origin_y) offsets.
+        """
+        if not ego_positions:
+            print("  ⚠ No ego positions for calibration!")
+            return
+        
+        ego_xy = np.array(ego_positions)  # (N, 2)
+        ego_x_mean = ego_xy[:, 0].mean()
+        ego_y_mean = ego_xy[:, 1].mean()
+        
+        # The ego centroid should map roughly to the center of the bitmap
+        # Initial estimate: origin_x = ego_x_mean - (width/2) * resolution
+        est_origin_x = ego_x_mean - (self.width / 2) * self.RESOLUTION
+        est_origin_y = ego_y_mean - (self.height / 2) * self.RESOLUTION
+        
+        best_score = -1
+        best_ox = est_origin_x
+        best_oy = est_origin_y
+        best_flip = False
+        
+        # Search around the initial estimate
+        search_range = 500  # meters
+        search_step = 5     # meters
+        
+        offsets_x = np.arange(est_origin_x - search_range, 
+                              est_origin_x + search_range, search_step)
+        offsets_y = np.arange(est_origin_y - search_range, 
+                              est_origin_y + search_range, search_step)
+        
+        for flip_y in [False, True]:
+            for ox in offsets_x:
+                for oy in offsets_y:
+                    # Map ego positions to pixels
+                    cols = ((ego_xy[:, 0] - ox) / self.RESOLUTION).astype(int)
+                    
+                    if flip_y:
+                        # Y increases upward in world, but row 0 is top of image
+                        rows = ((oy + self.height * self.RESOLUTION - ego_xy[:, 1]) 
+                                / self.RESOLUTION).astype(int)
+                    else:
+                        rows = ((ego_xy[:, 1] - oy) / self.RESOLUTION).astype(int)
+                    
+                    # Check bounds
+                    valid = ((cols >= 0) & (cols < self.width) & 
+                             (rows >= 0) & (rows < self.height))
+                    
+                    if valid.sum() < len(ego_xy) * 0.8:
+                        continue  # Too many out of bounds
+                    
+                    # Score: how many ego positions are on drivable pixels
+                    score = 0
+                    for i in range(len(ego_xy)):
+                        if valid[i]:
+                            if self.drivable[rows[i], cols[i]] > 0:
+                                score += 1
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_ox = ox
+                        best_oy = oy
+                        best_flip = flip_y
+        
+        self.origin_x = best_ox
+        self.origin_y = best_oy
+        self.flip_y = best_flip
+        
+        hit_rate = best_score / len(ego_xy)
+        print(f"  Calibration: origin=({best_ox:.1f}, {best_oy:.1f}), "
+              f"flip_y={best_flip}, hit_rate={hit_rate:.2%} ({best_score}/{len(ego_xy)})")
+        
+        if hit_rate < 0.5:
+            print(f"  ⚠ WARNING: Low hit rate — calibration may be wrong!")
+    
+    def is_drivable(self, world_x, world_y):
+        """Check if world coordinates are on drivable area.
+        
+        Args:
+            world_x: Array of world X coordinates.
+            world_y: Array of world Y coordinates.
+            
+        Returns:
+            Boolean array: True where drivable.
+        """
+        cols = ((world_x - self.origin_x) / self.RESOLUTION).astype(int)
+        
+        if self.flip_y:
+            rows = ((self.origin_y + self.height * self.RESOLUTION - world_y) 
+                    / self.RESOLUTION).astype(int)
+        else:
+            rows = ((world_y - self.origin_y) / self.RESOLUTION).astype(int)
+        
+        # Bounds check
+        valid = ((cols >= 0) & (cols < self.width) & 
+                 (rows >= 0) & (rows < self.height))
+        
+        result = np.zeros(len(world_x), dtype=bool)
+        valid_idx = np.where(valid)[0]
+        
+        if len(valid_idx) > 0:
+            result[valid_idx] = self.drivable[rows[valid_idx], cols[valid_idx]] > 0
+        
+        return result
+
+
+# =============================================================================
+# MASK GENERATOR
+# =============================================================================
+
+class NuScenesMaskGenerator:
+    """Generates drivable area masks using raw bitmap maps.
+    
+    Auto-calibrates coordinate mapping per location using ego poses,
+    then projects drivable ground-plane points to camera view.
+    """
+    
+    # Grid parameters
+    GRID_FORWARD = 50.0    # meters ahead of ego
+    GRID_BEHIND = 15.0     # meters behind ego
+    GRID_SIDE = 25.0       # meters left/right
+    GRID_RES = 0.05         # meters between grid points
+    
+    def __init__(self, dataroot):
+        """Initialize with nuScenes data."""
         self.dataroot = dataroot
         
-        # Load all metadata tables
+        # Load metadata
         self.scenes = load_table(dataroot, "scene.json")
         self.samples = load_table(dataroot, "sample.json")
         self.sample_data_list = load_table(dataroot, "sample_data.json")
         self.sensors = load_table(dataroot, "sensor.json")
         self.calibrated_sensors = load_table(dataroot, "calibrated_sensor.json")
         self.ego_poses = load_table(dataroot, "ego_pose.json")
-        self.maps = load_table(dataroot, "map.json")
+        self.maps_table = load_table(dataroot, "map.json")
         self.logs = load_table(dataroot, "log.json")
         
-        # Build token lookup maps
-        self.sample_data_map = build_token_map(self.sample_data_list)
+        # Build lookups
         self.calib_sensor_map = build_token_map(self.calibrated_sensors)
         self.ego_pose_map = build_token_map(self.ego_poses)
-        self.scene_map = build_token_map(self.scenes)
+        self.scene_token_map = build_token_map(self.scenes)
         self.log_map = build_token_map(self.logs)
-        self.map_map = build_token_map(self.maps)
         self.sample_map = build_token_map(self.samples)
+        self.sd_map = build_token_map(self.sample_data_list)
         
-        # Find CAM_FRONT sensor token
+        # Find CAM_FRONT sensor
         self.cam_front_token = None
         for s in self.sensors:
             if s['channel'] == 'CAM_FRONT':
                 self.cam_front_token = s['token']
                 break
         
-        # Get all CAM_FRONT calibrated sensor tokens
         self.cam_front_calib_tokens = set()
         for cs in self.calibrated_sensors:
             if cs['sensor_token'] == self.cam_front_token:
                 self.cam_front_calib_tokens.add(cs['token'])
         
-        # Load scene → log → map mapping
-        self.scene_to_map = {}
-        self.map_cache = {}
+        # Scene → location → map
+        self.scene_to_location = {}
+        self.location_to_map_record = {}
+        
         for scene in self.scenes:
-            # Find the log for this scene
-            log_token = scene.get('log_token')
-            if log_token and log_token in self.log_map:
-                log = self.log_map[log_token]
-                location = log['location']
-                # Find the map for this location
-                for m in self.maps:
-                    if log_token in m.get('log_tokens', []):
-                        self.scene_to_map[scene['token']] = m
-                        break
+            log = self.log_map.get(scene.get('log_token', ''))
+            if log:
+                self.scene_to_location[scene['token']] = log['location']
         
-        # Get all CAM_FRONT keyframe sample_data entries
-        self.cam_front_samples = []
-        for sd in self.sample_data_list:
-            if (sd['calibrated_sensor_token'] in self.cam_front_calib_tokens
-                    and sd['is_key_frame']):
-                self.cam_front_samples.append(sd)
+        for m in self.maps_table:
+            for lt in m.get('log_tokens', []):
+                if lt in self.log_map:
+                    loc = self.log_map[lt]['location']
+                    self.location_to_map_record[loc] = m
         
-        print(f"Loaded {len(self.cam_front_samples)} CAM_FRONT keyframes")
-        print(f"Scene-to-map mappings: {len(self.scene_to_map)}")
-    
-    def get_cam_front_for_sample(self, sample_token):
-        """Get the CAM_FRONT sample_data record for a given sample.
+        # CAM_FRONT keyframes
+        self.cam_front_samples = [
+            sd for sd in self.sample_data_list
+            if sd['calibrated_sensor_token'] in self.cam_front_calib_tokens
+            and sd['is_key_frame']
+        ]
         
-        Args:
-            sample_token: Token of the sample (keyframe).
-            
-        Returns:
-            sample_data record dict for CAM_FRONT, or None.
-        """
+        # Collect ego positions per location for calibration
+        location_ego_positions = {}
         for sd in self.cam_front_samples:
-            if sd.get('sample_token') == sample_token:
-                return sd
-        return None
-    
-    def generate_mask_for_sample_data(self, sd_record, img_height=900, img_width=1600):
-        """Generate drivable area mask for a single CAM_FRONT sample_data record.
+            sample = self.sample_map.get(sd.get('sample_token', ''))
+            if sample is None:
+                continue
+            scene = self.scene_token_map.get(sample['scene_token'])
+            if scene is None:
+                continue
+            loc = self.scene_to_location.get(scene['token'])
+            if loc is None:
+                continue
+            ego = self.ego_pose_map.get(sd['ego_pose_token'])
+            if ego:
+                location_ego_positions.setdefault(loc, []).append(
+                    (ego['translation'][0], ego['translation'][1])
+                )
         
-        Process:
-        1. Get ego pose for this timestamp
-        2. Get camera calibration (intrinsics + extrinsics)
-        3. Load the BEV map for the scene
-        4. Create a dense grid of ground-plane points around the ego vehicle
-        5. Transform points: world → ego → camera → pixel
-        6. Sample the BEV drivable mask at each point's world location
-        7. Build the camera-view mask
-        
-        Args:
-            sd_record: sample_data record dict for CAM_FRONT.
-            img_height: Camera image height.
-            img_width: Camera image width.
+        # Load and calibrate bitmap maps
+        self.bitmap_maps = {}
+        print(f"\nLoading bitmap maps...")
+        for loc, map_record in self.location_to_map_record.items():
+            map_path = os.path.join(dataroot, map_record['filename'])
+            if not os.path.exists(map_path):
+                print(f"  ✗ Map file not found: {map_path}")
+                continue
             
-        Returns:
-            Binary mask as numpy array (img_height, img_width), or None on failure.
+            ego_pos = location_ego_positions.get(loc, [])
+            print(f"\n  Location: {loc} ({len(ego_pos)} ego positions)")
+            
+            try:
+                bm = BitmapMap(map_path, ego_pos)
+                self.bitmap_maps[loc] = bm
+                print(f"  ✓ Loaded and calibrated")
+            except Exception as e:
+                print(f"  ✗ Failed: {e}")
+        
+        print(f"\nLoaded {len(self.cam_front_samples)} CAM_FRONT keyframes")
+        print(f"Calibrated {len(self.bitmap_maps)} bitmap maps")
+    
+    def generate_mask_for_sample_data(self, sd_record, img_h=900, img_w=1600):
+        """Generate drivable mask for one CAM_FRONT keyframe.
+        
+        1. Get ego pose and camera calibration
+        2. Create ground-plane grid around ego
+        3. Check bitmap for drivable status
+        4. Project drivable points to camera
+        5. Fill and clean mask
         """
-        # Get ego pose
         ego_pose = self.ego_pose_map.get(sd_record['ego_pose_token'])
-        if ego_pose is None:
-            return None
-        
-        # Get calibrated sensor
         calib = self.calib_sensor_map.get(sd_record['calibrated_sensor_token'])
-        if calib is None:
+        if ego_pose is None or calib is None:
             return None
         
-        # Find the scene for this sample
-        sample_token = sd_record.get('sample_token')
-        if sample_token is None:
-            return None
-        sample = self.sample_map.get(sample_token)
+        sample = self.sample_map.get(sd_record.get('sample_token', ''))
         if sample is None:
             return None
         scene_token = sample['scene_token']
+        location = self.scene_to_location.get(scene_token)
         
-        # Get the BEV map for this scene
-        map_record = self.scene_to_map.get(scene_token)
-        if map_record is None:
+        bm = self.bitmap_maps.get(location)
+        if bm is None:
             return None
         
-        # Load BEV map (cached)
-        map_token = map_record['token']
-        if map_token not in self.map_cache:
-            bev = load_bev_map(self.dataroot, map_record['filename'])
-            drivable = extract_drivable_from_bev(bev)
-            self.map_cache[map_token] = (bev, drivable)
-        _, drivable_bev = self.map_cache[map_token]
-        
-        # Build transformation matrices
-        # Ego pose: transforms from ego frame to world frame
+        # Camera transform
         ego_T = get_transform_matrix(ego_pose['translation'], ego_pose['rotation'])
-        
-        # Camera extrinsics: transforms from camera frame to ego frame
         cam_T = get_transform_matrix(calib['translation'], calib['rotation'])
-        
-        # Camera intrinsics: 3×3 matrix
         K = np.array(calib['camera_intrinsic'])
         
-        # World-to-camera transform: inv(cam_T) @ inv(ego_T)
-        world_to_ego = np.linalg.inv(ego_T)
-        ego_to_cam = np.linalg.inv(cam_T)
-        world_to_cam = ego_to_cam @ world_to_ego
+        world_to_cam = np.linalg.inv(cam_T) @ np.linalg.inv(ego_T)
         
-        # Create a grid of ground-plane points in ego vehicle frame
-        # The ground plane is at z=0 in the world frame
-        ego_x = ego_pose['translation'][0]
-        ego_y = ego_pose['translation'][1]
+        # Create ground-plane grid around ego
+        ego_x, ego_y = ego_pose['translation'][0], ego_pose['translation'][1]
+        ego_rot = Quaternion(ego_pose['rotation'])
+        yaw = ego_rot.yaw_pitch_roll[0]
         
-        # Generate grid of world points on the ground plane
-        # More points = higher quality mask, but slower
-        grid_resolution = 0.2  # meters between grid points
+        fwd = np.arange(-self.GRID_BEHIND, self.GRID_FORWARD, self.GRID_RES)
+        lat = np.arange(-self.GRID_SIDE, self.GRID_SIDE, self.GRID_RES)
+        ff, ll = np.meshgrid(fwd, lat)
+        ff, ll = ff.ravel(), ll.ravel()
         
-        x_range = np.arange(
-            ego_x - self.BEV_RANGE_BEHIND,
-            ego_x + self.BEV_RANGE_FORWARD,
-            grid_resolution
-        )
-        y_range = np.arange(
-            ego_y - self.BEV_RANGE_SIDE,
-            ego_y + self.BEV_RANGE_SIDE,
-            grid_resolution
-        )
+        # Rotate to world frame
+        cos_y, sin_y = np.cos(yaw), np.sin(yaw)
+        wx = ego_x + ff * cos_y - ll * sin_y
+        wy = ego_y + ff * sin_y + ll * cos_y
         
-        xx, yy = np.meshgrid(x_range, y_range)
-        zz = np.zeros_like(xx)  # Ground plane at z=0
-        ones = np.ones_like(xx)
+        # Check drivable status in bitmap
+        drivable = bm.is_drivable(wx, wy)
         
-        # Stack into (4, N) homogeneous world coordinates
-        world_points = np.stack([xx.ravel(), yy.ravel(), zz.ravel(), ones.ravel()], axis=0)
+        if drivable.sum() == 0:
+            return np.zeros((img_h, img_w), dtype=np.float32)
         
-        # Transform to camera frame
-        cam_points = world_to_cam @ world_points  # (4, N)
+        # Build 3D world points on ground (z=0)
+        n = len(wx)
+        world_pts = np.stack([wx, wy, np.zeros(n), np.ones(n)], axis=0)  # (4, N)
         
-        # Filter points behind the camera (z <= 0)
-        z = cam_points[2, :]
-        valid = z > 0.1  # Must be in front of camera
+        # Project to camera
+        cam_pts = world_to_cam @ world_pts  # (4, N)
+        z = cam_pts[2, :]
+        
+        # Keep points in front of camera AND drivable
+        valid = (z > 0.5) & drivable
         
         if valid.sum() == 0:
-            return np.zeros((img_height, img_width), dtype=np.float32)
+            return np.zeros((img_h, img_w), dtype=np.float32)
         
-        # Project to pixel coordinates: [u, v, 1]^T = K @ [X/Z, Y/Z, 1]^T
-        cam_points_valid = cam_points[:3, valid]
-        cam_points_valid[0, :] /= cam_points_valid[2, :]
-        cam_points_valid[1, :] /= cam_points_valid[2, :]
-        cam_points_valid[2, :] = 1.0
+        # Perspective projection
+        cam_3 = cam_pts[:3, valid].copy()
+        cam_3[0] /= cam_3[2]
+        cam_3[1] /= cam_3[2]
+        cam_3[2] = 1.0
         
-        pixel_coords = K @ cam_points_valid  # (3, N_valid)
-        u = pixel_coords[0, :].astype(int)
-        v = pixel_coords[1, :].astype(int)
+        px = K @ cam_3
+        u = px[0].astype(int)
+        v = px[1].astype(int)
         
-        # Filter to image bounds
-        in_bounds = (u >= 0) & (u < img_width) & (v >= 0) & (v < img_height)
+        in_img = (u >= 0) & (u < img_w) & (v >= 0) & (v < img_h)
         
-        # Sample drivable status from BEV map
-        world_x = world_points[0, valid][in_bounds]
-        world_y = world_points[1, valid][in_bounds]
+        # Build mask
+        mask = np.zeros((img_h, img_w), dtype=np.uint8)
+        mask[v[in_img], u[in_img]] = 255
         
-        # Convert world coordinates to BEV map pixel coordinates
-        # nuScenes maps: origin is at the map center, resolution ~ 0.1 m/pixel
-        bev_h, bev_w = drivable_bev.shape[:2]
+        # Near-field (bottom 40%): aggressive closing for dense projected points
+        kernel_near = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+        near_field = mask[int(img_h * 0.6):, :]
+        near_field = cv2.morphologyEx(near_field, cv2.MORPH_CLOSE, kernel_near)
+        mask[int(img_h * 0.6):, :] = near_field
+
+        # Far-field: standard closing
+        kernel_far = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_far)
+
+        # Light opening to remove salt noise only
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open)
         
-        # The map coordinates are typically in the same frame as the world pose
-        # Map pixel = world_coord / resolution
-        # Maps are centered differently by location, we need to figure out the mapping
-        map_px = (world_x / self.MAP_RESOLUTION).astype(int)
-        map_py = (world_y / self.MAP_RESOLUTION).astype(int)
+        # Sky cutoff: top 25% can't be road
+        mask[:int(img_h * 0.25), :] = 0
+
+        seed_x = img_w // 2
+        seed_y = img_h - 5
+        if mask[seed_y, seed_x] == 255:
+            flood = mask.copy()
+            cv2.floodFill(flood, None, (seed_x, seed_y), 128)
+            mask = ((flood == 255) | (flood == 128)).astype(np.uint8) * 255
         
-        # Clamp to map bounds
-        map_px = np.clip(map_px, 0, bev_w - 1)
-        map_py = np.clip(map_py, 0, bev_h - 1)
-        
-        # Sample drivable values
-        drivable_values = drivable_bev[map_py, map_px]
-        
-        # Build output mask
-        mask = np.zeros((img_height, img_width), dtype=np.float32)
-        u_valid = u[in_bounds]
-        v_valid = v[in_bounds]
-        mask[v_valid, u_valid] = drivable_values.astype(np.float32)
-        
-        # Fill gaps with morphological closing (the grid sampling creates gaps)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        
-        # Apply a simple heuristic: the bottom portion of the image is more
-        # likely to be road. We can use this as a soft prior.
-        # Also, sky region (top ~1/3) should definitely not be drivable
-        sky_cutoff = img_height // 3
-        mask[:sky_cutoff, :] = 0
-        
-        return mask
+        return (mask > 127).astype(np.float32)
     
-    def generate_all_masks(self, output_dir, visualize_count=5):
-        """Generate drivable masks for all CAM_FRONT keyframes.
-        
-        Args:
-            output_dir: Directory to save mask PNGs.
-            visualize_count: Number of sample pairs to visualize.
-            
-        Returns:
-            Dict with statistics about the generated masks.
-        """
+    def generate_all_masks(self, output_dir, vis_count=10):
+        """Generate masks for all CAM_FRONT keyframes."""
         os.makedirs(output_dir, exist_ok=True)
         vis_dir = os.path.join(output_dir, "visualizations")
         os.makedirs(vis_dir, exist_ok=True)
         
-        stats = {
-            'total': 0,
-            'successful': 0,
-            'failed': 0,
-            'drivable_ratios': [],
-            'filenames': []
-        }
-        
-        vis_count = 0
+        stats = {'total': 0, 'ok': 0, 'fail': 0, 
+                 'no_img': 0, 'ratios': [], 'files': []}
+        vis_done = 0
         
         for sd in tqdm(self.cam_front_samples, desc="Generating masks"):
             stats['total'] += 1
             
             try:
-                mask = self.generate_mask_for_sample_data(
-                    sd, img_height=900, img_width=1600
-                )
-                
+                mask = self.generate_mask_for_sample_data(sd)
                 if mask is None:
-                    stats['failed'] += 1
+                    stats['fail'] += 1
                     continue
                 
-                # Save mask
-                img_filename = os.path.basename(sd['filename'])
-                mask_filename = img_filename.replace('.jpg', '_mask.png')
-                mask_path = os.path.join(output_dir, mask_filename)
-                cv2.imwrite(mask_path, (mask * 255).astype(np.uint8))
+                img_path = os.path.join(self.dataroot, sd['filename'])
+                if not os.path.exists(img_path):
+                    stats['no_img'] += 1
+                    continue
                 
-                stats['successful'] += 1
-                stats['filenames'].append((sd['filename'], mask_filename))
+                fn = os.path.basename(sd['filename'])
+                mask_fn = fn.replace('.jpg', '_mask.png')
+                cv2.imwrite(os.path.join(output_dir, mask_fn), 
+                           (mask * 255).astype(np.uint8))
                 
-                # Calculate drivable ratio
+                stats['ok'] += 1
+                stats['files'].append((sd['filename'], mask_fn))
+                
                 ratio = mask.sum() / mask.size
-                stats['drivable_ratios'].append(ratio)
+                stats['ratios'].append(ratio)
                 
-                # Visualize
-                if vis_count < visualize_count:
-                    img_path = os.path.join(self.dataroot, sd['filename'])
-                    image = cv2.imread(img_path)
-                    if image is not None:
-                        self._visualize_pair(
-                            image, mask, 
-                            os.path.join(vis_dir, f"sample_{vis_count}.png"),
-                            img_filename
-                        )
-                        vis_count += 1
-                
+                if vis_done < vis_count:
+                    img = cv2.imread(img_path)
+                    if img is not None:
+                        self._vis(img, mask,
+                                  os.path.join(vis_dir, f"sample_{vis_done:02d}.png"),
+                                  fn, ratio)
+                        vis_done += 1
+                        
             except Exception as e:
-                print(f"Error processing {sd.get('filename', 'unknown')}: {e}")
-                stats['failed'] += 1
+                print(f"\nError on {sd.get('filename','?')}: {e}")
+                import traceback
+                traceback.print_exc()
+                stats['fail'] += 1
         
-        # Print statistics
-        self._print_stats(stats)
-        
+        self._stats(stats)
         return stats
     
-    def _visualize_pair(self, image, mask, save_path, title=""):
-        """Visualize an image-mask pair.
-        
-        Args:
-            image: BGR image array.
-            mask: Binary mask array.
-            save_path: Path to save visualization.
-            title: Title for the visualization.
-        """
+    def _vis(self, image, mask, path, title, ratio):
+        """Save visualization."""
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
         
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        fig, axes = plt.subplots(1, 3, figsize=(20, 7))
         
-        # Original image (BGR to RGB)
         axes[0].imshow(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
         axes[0].set_title(f'Input: {title[:50]}')
         axes[0].axis('off')
         
-        # Mask
         axes[1].imshow(mask, cmap='gray')
-        axes[1].set_title(f'Drivable Mask (ratio: {mask.mean():.3f})')
+        axes[1].set_title(f'Mask (ratio: {ratio:.3f})')
         axes[1].axis('off')
         
-        # Overlay
         overlay = image.copy()
-        green_overlay = np.zeros_like(image)
-        green_overlay[:, :, 1] = 255
-        drivable = mask > 0.5
-        overlay[drivable] = cv2.addWeighted(
-            image[drivable], 0.6, green_overlay[drivable], 0.4, 0
-        )
+        green = np.zeros_like(image); green[:,:,1] = 255
+        d = mask > 0.5
+        overlay[d] = cv2.addWeighted(image[d], 0.5, green[d], 0.5, 0)
         axes[2].imshow(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
-        axes[2].set_title('Overlay (green = drivable)')
+        axes[2].set_title('Overlay')
         axes[2].axis('off')
         
+        plt.suptitle('Bitmap-Projected Drivable Mask', fontsize=14, fontweight='bold')
         plt.tight_layout()
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.savefig(path, dpi=150, bbox_inches='tight')
         plt.close()
     
-    def _print_stats(self, stats):
-        """Print dataset statistics.
-        
-        Args:
-            stats: Dictionary with generation statistics.
-        """
-        print("\n" + "=" * 50)
+    def _stats(self, s):
+        """Print stats."""
+        print("\n" + "=" * 60)
         print("MASK GENERATION STATISTICS")
-        print("=" * 50)
-        print(f"Total CAM_FRONT keyframes: {stats['total']}")
-        print(f"Successfully generated: {stats['successful']}")
-        print(f"Failed: {stats['failed']}")
+        print("=" * 60)
+        print(f"Total:       {s['total']}")
+        print(f"Successful:  {s['ok']}")
+        print(f"Failed:      {s['fail']}")
+        print(f"No image:    {s['no_img']}")
         
-        if stats['drivable_ratios']:
-            ratios = np.array(stats['drivable_ratios'])
-            print(f"\nDrivable pixel ratio:")
-            print(f"  Mean:   {ratios.mean():.4f}")
-            print(f"  Std:    {ratios.std():.4f}")
-            print(f"  Min:    {ratios.min():.4f}")
-            print(f"  Max:    {ratios.max():.4f}")
-            print(f"  Median: {np.median(ratios):.4f}")
-        print("=" * 50)
-
-
-def create_simple_road_masks(dataroot, output_dir, visualize_count=5):
-    """Fallback: Create road masks using simple geometric priors.
-    
-    If BEV projection doesn't produce good results, use a pragmatic
-    approach: assume the lower-center portion of the image is road,
-    and refine using color/edge detection.
-    
-    This is a valid approach for a hackathon since:
-    1. In most front-camera driving images, the road IS in the bottom half
-    2. We can use perspective-geometry + vanishing point estimation
-    3. Edge detection helps find road boundaries
-    
-    Args:
-        dataroot: Root of nuScenes dataset.
-        output_dir: Directory to save masks.
-        visualize_count: Number of visualizations to produce.
-    """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    
-    os.makedirs(output_dir, exist_ok=True)
-    vis_dir = os.path.join(output_dir, "visualizations")
-    os.makedirs(vis_dir, exist_ok=True)
-    
-    # Load CAM_FRONT sample_data entries
-    sample_data_list = load_table(dataroot, "sample_data.json")
-    sensors = load_table(dataroot, "sensor.json")
-    calibrated_sensors = load_table(dataroot, "calibrated_sensor.json")
-    
-    cam_front_token = None
-    for s in sensors:
-        if s['channel'] == 'CAM_FRONT':
-            cam_front_token = s['token']
-            break
-    
-    cam_front_calib_tokens = set()
-    for cs in calibrated_sensors:
-        if cs['sensor_token'] == cam_front_token:
-            cam_front_calib_tokens.add(cs['token'])
-    
-    cam_front_samples = [
-        sd for sd in sample_data_list
-        if sd['calibrated_sensor_token'] in cam_front_calib_tokens
-        and sd['is_key_frame']
-    ]
-    
-    print(f"Generating masks for {len(cam_front_samples)} CAM_FRONT keyframes...")
-    
-    stats = {'total': 0, 'drivable_ratios': [], 'filenames': []}
-    vis_count = 0
-    
-    for sd in tqdm(cam_front_samples, desc="Generating masks"):
-        img_path = os.path.join(dataroot, sd['filename'])
-        image = cv2.imread(img_path)
-        if image is None:
-            continue
-        
-        stats['total'] += 1
-        h, w = image.shape[:2]
-        
-        # Generate road mask using color and geometric analysis
-        mask = generate_road_mask_adaptive(image)
-        
-        # Save mask
-        img_filename = os.path.basename(sd['filename'])
-        mask_filename = img_filename.replace('.jpg', '_mask.png')
-        mask_path = os.path.join(output_dir, mask_filename)
-        cv2.imwrite(mask_path, (mask * 255).astype(np.uint8))
-        
-        ratio = mask.sum() / mask.size
-        stats['drivable_ratios'].append(ratio)
-        stats['filenames'].append((sd['filename'], mask_filename))
-        
-        # Visualize
-        if vis_count < visualize_count:
-            fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-            axes[0].imshow(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-            axes[0].set_title('Input Image')
-            axes[0].axis('off')
+        if s['ratios']:
+            r = np.array(s['ratios'])
+            print(f"\nDrivable ratio:")
+            print(f"  Mean:   {r.mean():.4f}")
+            print(f"  Std:    {r.std():.4f}")
+            print(f"  Min:    {r.min():.4f}")
+            print(f"  Max:    {r.max():.4f}")
+            print(f"  Median: {np.median(r):.4f}")
             
-            axes[1].imshow(mask, cmap='gray')
-            axes[1].set_title(f'Drivable Mask (ratio: {ratio:.3f})')
-            axes[1].axis('off')
-            
-            overlay = image.copy()
-            green = np.zeros_like(image)
-            green[:, :, 1] = 255
-            drivable = mask > 0.5
-            overlay[drivable] = cv2.addWeighted(
-                image[drivable], 0.6, green[drivable], 0.4, 0
-            )
-            axes[2].imshow(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
-            axes[2].set_title('Overlay')
-            axes[2].axis('off')
-            
-            plt.tight_layout()
-            plt.savefig(os.path.join(vis_dir, f"sample_{vis_count}.png"), dpi=150)
-            plt.close()
-            vis_count += 1
-    
-    # Print stats
-    if stats['drivable_ratios']:
-        ratios = np.array(stats['drivable_ratios'])
-        print(f"\nMask Statistics:")
-        print(f"  Total masks: {stats['total']}")
-        print(f"  Mean drivable ratio: {ratios.mean():.4f}")
-        print(f"  Std: {ratios.std():.4f}")
-        print(f"  Min: {ratios.min():.4f}, Max: {ratios.max():.4f}")
-    
-    return stats
-
-
-def generate_road_mask_adaptive(image):
-    """Generate a road mask using adaptive color and geometric analysis.
-    
-    Multi-step approach:
-    1. Convert to multiple color spaces (HSV, LAB) for robust road detection
-    2. Use perspective geometry: road converges at vanishing point
-    3. Apply GrabCut-style iterative refinement
-    4. Clean up with morphological operations
-    
-    Args:
-        image: BGR image array (H, W, 3).
-        
-    Returns:
-        Binary mask (H, W) with 1.0 for drivable pixels.
-    """
-    h, w = image.shape[:2]
-    
-    # Convert color spaces
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    
-    # Strategy 1: Road color detection
-    # Roads in urban scenes are typically gray/dark with low saturation
-    # Sample the road color from the bottom-center region (high confidence road area)
-    sample_region = image[int(h * 0.75):int(h * 0.95), int(w * 0.3):int(w * 0.7)]
-    
-    if sample_region.size == 0:
-        return np.zeros((h, w), dtype=np.float32)
-    
-    # Compute mean and std of the road color in LAB space
-    sample_lab = cv2.cvtColor(sample_region, cv2.COLOR_BGR2LAB)
-    road_mean = sample_lab.mean(axis=(0, 1))
-    road_std = sample_lab.std(axis=(0, 1))
-    
-    # Color distance from road reference in LAB space
-    lab_diff = np.sqrt(((lab.astype(np.float32) - road_mean) ** 2).sum(axis=2))
-    
-    # Threshold based on color distance
-    # Adaptive threshold based on the variance of the road sample
-    threshold = max(np.sqrt((road_std ** 2).sum()) * 2.5, 25)
-    color_mask = (lab_diff < threshold).astype(np.float32)
-    
-    # Strategy 2: Geometric prior (trapezoidal road shape)
-    # The road typically forms a trapezoid in perspective view
-    geo_mask = np.zeros((h, w), dtype=np.float32)
-    
-    # Vanishing point approximately at image center-top
-    vp_x = w // 2
-    vp_y = int(h * 0.38)  # Slightly above center
-    
-    # Create trapezoidal road region with perspective
-    pts = np.array([
-        [int(w * 0.05), h],       # Bottom-left
-        [int(w * 0.95), h],       # Bottom-right
-        [int(w * 0.65), vp_y],    # Top-right
-        [int(w * 0.35), vp_y],    # Top-left
-    ], dtype=np.int32)
-    
-    cv2.fillPoly(geo_mask, [pts], 1.0)
-    
-    # Strategy 3: Edge-based refinement
-    # Roads have less texture than surroundings
-    edges = cv2.Canny(gray, 30, 100)
-    # Dilate edges to create boundary regions
-    edge_dilated = cv2.dilate(edges, np.ones((5, 5), np.uint8), iterations=2)
-    texture_mask = 1.0 - (edge_dilated / 255.0) * 0.3  # Subtle edge penalty
-    
-    # Combine strategies
-    combined = color_mask * 0.5 + geo_mask * 0.3 + texture_mask * 0.2
-    
-    # Threshold to binary
-    mask = (combined > 0.45).astype(np.float32)
-    
-    # Apply geometric constraint: road must be connected from bottom
-    # Use flood fill from bottom-center
-    seed_mask = np.zeros((h, w), dtype=np.float32)
-    
-    # Flood fill from multiple bottom points
-    from scipy import ndimage
-    # Label connected components
-    labeled, num_features = ndimage.label(mask)
-    
-    if num_features > 0:
-        # Find which component(s) touch the bottom of the image
-        bottom_row = labeled[h - 5:h, :]
-        bottom_labels = set(bottom_row[bottom_row > 0])
-        
-        # Keep only components connected to bottom
-        road_mask = np.zeros_like(mask)
-        for lbl in bottom_labels:
-            road_mask[labeled == lbl] = 1.0
-        mask = road_mask
-    
-    # Sky removal: nothing above the horizon should be drivable
-    horizon = int(h * 0.35)
-    mask[:horizon, :] = 0
-    
-    # Morphological cleanup
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open)
-    
-    # Smooth edges with Gaussian blur + re-threshold
-    mask = cv2.GaussianBlur(mask, (11, 11), 0)
-    mask = (mask > 0.5).astype(np.float32)
-    
-    return mask
+            if r.mean() > 0.40:
+                print("  ⚠ May over-predict")
+            elif r.mean() < 0.08:
+                print("  ⚠ May under-predict")
+            else:
+                print("  ✓ Looks reasonable")
+        print("=" * 60)
 
 
 def main():
-    """Main entry point for mask generation."""
-    parser = argparse.ArgumentParser(description="Generate drivable area masks")
-    parser.add_argument('--dataroot', type=str, default='./',
-                        help='Root directory of nuScenes dataset')
-    parser.add_argument('--output_dir', type=str, default='masks',
-                        help='Output directory for masks')
-    parser.add_argument('--visualize', type=int, default=5,
-                        help='Number of sample pairs to visualize')
-    parser.add_argument('--method', type=str, default='adaptive',
-                        choices=['bev', 'adaptive'],
-                        help='Mask generation method: bev (BEV projection) or adaptive (color+geometry)')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataroot', default='./')
+    parser.add_argument('--output_dir', default='masks')
+    parser.add_argument('--visualize', type=int, default=10)
     args = parser.parse_args()
     
-    if args.method == 'bev':
-        print("Using BEV projection method...")
-        generator = NuScenesMaskGenerator(args.dataroot)
-        stats = generator.generate_all_masks(args.output_dir, args.visualize)
-    else:
-        print("Using adaptive color+geometry method...")
-        stats = create_simple_road_masks(args.dataroot, args.output_dir, args.visualize)
+    print("=" * 60)
+    print("PRISM — Drivable Mask Generator (Bitmap + Auto-Calibration)")
+    print("=" * 60)
     
-    # Save file mapping for dataset loading
-    mapping_path = os.path.join(args.output_dir, "file_mapping.json")
-    with open(mapping_path, 'w') as f:
-        json.dump(stats.get('filenames', []), f, indent=2)
-    print(f"\nFile mapping saved to {mapping_path}")
+    if not os.path.exists(os.path.join(args.dataroot, "v1.0-mini")):
+        print("ERROR: v1.0-mini/ not found!")
+        return
+    
+    gen = NuScenesMaskGenerator(args.dataroot)
+    stats = gen.generate_all_masks(args.output_dir, args.visualize)
+    
+    with open(os.path.join(args.output_dir, "file_mapping.json"), 'w') as f:
+        json.dump(stats.get('files', []), f, indent=2)
+    
+    print(f"\nDone! {stats['ok']} masks saved to '{args.output_dir}'")
 
 
 if __name__ == '__main__':
