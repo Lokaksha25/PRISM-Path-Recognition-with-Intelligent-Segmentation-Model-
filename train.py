@@ -59,10 +59,10 @@ def parse_args():
                         help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=16,
                         help='Training batch size')
-    parser.add_argument('--lr', type=float, default=6e-3,
-                        help='Peak learning rate (for OneCycleLR)')
-    parser.add_argument('--weight_decay', type=float, default=1e-4,
-                        help='Weight decay for AdamW')
+    parser.add_argument('--lr', type=float, default=3e-3,
+                        help='Peak learning rate (reduced for stability)')
+    parser.add_argument('--weight_decay', type=float, default=5e-4,
+                        help='Weight decay for AdamW (increased to fight overfitting)')
     parser.add_argument('--num_workers', type=int, default=0,
                         help='DataLoader workers (0 for Windows)')
     parser.add_argument('--grad_accum', type=int, default=1,
@@ -79,8 +79,8 @@ def parse_args():
     parser.add_argument('--scheduler', type=str, default='onecycle',
                         choices=['onecycle', 'cosine'],
                         help='LR scheduler: onecycle (recommended) or cosine')
-    parser.add_argument('--warmup_pct', type=float, default=0.3,
-                        help='Fraction of training for warmup (OneCycleLR)')
+    parser.add_argument('--warmup_pct', type=float, default=0.35,
+                        help='Fraction of training for warmup (increased for stability)')
     
     # Knowledge distillation
     parser.add_argument('--distill', action='store_true',
@@ -147,8 +147,12 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device,
         images = images.to(device)
         masks = masks.to(device)
         
-        # Forward pass — model returns raw logits
-        logits = model(images)
+        # Forward pass — model returns (seg_logits, boundary_logits) in training
+        output = model(images)
+        if isinstance(output, tuple):
+            logits, boundary_logits = output
+        else:
+            logits, boundary_logits = output, None
         
         # Compute loss on logits
         if teacher_model is not None and distill_loss_fn is not None:
@@ -157,7 +161,11 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device,
                 teacher_logits = teacher_model(images)
             loss = distill_loss_fn(logits, teacher_logits, masks)
         else:
-            loss = criterion(logits, masks)
+            # Pass boundary_logits only if criterion supports it (PRISMLossV2)
+            if boundary_logits is not None and hasattr(criterion, 'boundary_head_loss'):
+                loss = criterion(logits, masks, boundary_logits=boundary_logits)
+            else:
+                loss = criterion(logits, masks)
         
         # Scale loss for gradient accumulation
         loss = loss / grad_accum
@@ -167,7 +175,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device,
         
         # Step optimizer every grad_accum batches
         if (batch_idx + 1) % grad_accum == 0 or (batch_idx + 1) == len(dataloader):
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
             optimizer.step()
             optimizer.zero_grad()
             
@@ -312,6 +320,33 @@ def measure_fps(model, device, input_size=(1, 3, 256, 448), n_runs=100):
     return fps
 
 
+class EarlyStopping:
+    """Stop training when val mIoU stops improving.
+    
+    Args:
+        patience: Epochs to wait after last improvement.
+        min_delta: Minimum change to qualify as improvement.
+    """
+    def __init__(self, patience=10, min_delta=0.001):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best_score = None
+        self.counter = 0
+        self.should_stop = False
+    
+    def __call__(self, val_miou):
+        if self.best_score is None:
+            self.best_score = val_miou
+        elif val_miou < self.best_score + self.min_delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.should_stop = True
+                print(f"  ⚠ Early stopping triggered (no improvement for {self.patience} epochs)")
+        else:
+            self.best_score = val_miou
+            self.counter = 0
+
+
 def main():
     """Main training loop."""
     args = parse_args()
@@ -442,8 +477,12 @@ def main():
         'lr': []
     }
     
+    # Early stopping callback
+    early_stopping = EarlyStopping(patience=10, min_delta=0.001)
+    
     print(f"\nStarting training for {args.epochs} epochs...")
     print(f"Effective batch size: {args.batch_size * args.grad_accum}")
+    print(f"Early stopping: patience={early_stopping.patience}")
     print(f"{'='*60}\n")
     
     # =========================================================================
@@ -533,6 +572,12 @@ def main():
               f"F1: {val_metrics['f1']:.3f} | "
               f"LR: {current_lr:.6f} | "
               f"{epoch_time:.1f}s{best_marker}")
+        
+        # Check early stopping
+        early_stopping(val_metrics['miou'])
+        if early_stopping.should_stop:
+            print(f"\nEarly stopping at epoch {epoch+1}")
+            break
         
         # Detailed report every 10 epochs
         if (epoch + 1) % 10 == 0:
