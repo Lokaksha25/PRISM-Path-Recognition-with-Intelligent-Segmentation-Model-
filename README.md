@@ -20,51 +20,51 @@ PRISM is a lightweight binary segmentation network that classifies every pixel i
 ## 🏗️ Architecture
 
 ```
-Input (3×256×448)
-    │
-    ▼
+        Input (3×256×448)
+              │
+              ▼
 ┌──────────────────────────────────┐
 │   CoordConv Stem                 │
 │   (Injects x,y spatial priors)   │
 └──────────────┬───────────────────┘
                │
-    ▼
+               ▼
 ┌──────────────────────────────────┐
 │   MobileNetV2 Encoder            │
 │   (Inverted Residual Blocks)     │
 │   Depthwise Separable Convs      │
-│   ──skip@1/4── ──skip@1/8──     │
+│   ──skip@1/4── ──skip@1/8──      │
 └──────────────┬───────────────────┘
                │
-    ▼
+               ▼
 ┌──────────────────────────────────┐
 │   Reflection Attention Unit (RAU)│
 │   Detects water puddles via      │
 │   vertical sky-ground correlation│
 └──────────────┬───────────────────┘
                │
-    ▼
+               ▼
 ┌──────────────────────────────────┐
 │   ASPP Decoder                   │
-│   Dilations: 6, 12, 18          │
+│   Dilations: 6, 12, 18           │
 │   + Global Average Pooling       │
 │   Multi-scale context capture    │
 └──────────────┬───────────────────┘
                │
-    ▼
+               ▼
 ┌──────────────────────────────────┐
 │   U-Net Decoder with SE Attention│
-│   1/16 → 1/8 (+ skip_8x)       │
-│   1/8  → 1/4 (+ skip_4x)       │
+│   1/16 → 1/8 (+ skip_8x)         │
+│   1/8  → 1/4 (+ skip_4x)         │
 │   Channel Recalibration (SE)     │
-│   1/4  → Full (bilinear up)     │
+│   1/4  → Full (bilinear up)      │
 └──────────────┬───────────────────┘
                │
-    ▼
+               ▼
 ┌──────────────────────────────────┐
 │   Segmentation Head              │
-│   Conv3×3 → Conv1×1 → Sigmoid   │
-│   Output: 1×256×448 (binary)    │
+│   Conv3×3 → Conv1×1 → Sigmoid    │
+│   Output: 1×256×448 (binary)     │
 └──────────────────────────────────┘
 ```
 
