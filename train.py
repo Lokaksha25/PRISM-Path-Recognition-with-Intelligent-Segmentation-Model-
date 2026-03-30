@@ -147,8 +147,12 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device,
         images = images.to(device)
         masks = masks.to(device)
         
-        # Forward pass — model returns raw logits
-        logits = model(images)
+        # Forward pass — model returns (seg_logits, boundary_logits) in training
+        output = model(images)
+        if isinstance(output, tuple):
+            logits, boundary_logits = output
+        else:
+            logits, boundary_logits = output, None
         
         # Compute loss on logits
         if teacher_model is not None and distill_loss_fn is not None:
@@ -157,7 +161,11 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device,
                 teacher_logits = teacher_model(images)
             loss = distill_loss_fn(logits, teacher_logits, masks)
         else:
-            loss = criterion(logits, masks)
+            # Pass boundary_logits only if criterion supports it (PRISMLossV2)
+            if boundary_logits is not None and hasattr(criterion, 'boundary_head_loss'):
+                loss = criterion(logits, masks, boundary_logits=boundary_logits)
+            else:
+                loss = criterion(logits, masks)
         
         # Scale loss for gradient accumulation
         loss = loss / grad_accum
