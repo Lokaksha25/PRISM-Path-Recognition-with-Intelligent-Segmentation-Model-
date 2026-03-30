@@ -52,6 +52,10 @@ def parse_args():
                         help='Apply boundary refinement')
     parser.add_argument('--tta', action='store_true',
                         help='Apply Test-Time Augmentation')
+    parser.add_argument('--suppress_vehicles', action='store_true',
+                        help='Suppress vehicles/people from drivable mask using YOLOv8n')
+    parser.add_argument('--yolo_conf', type=float, default=0.35,
+                        help='YOLOv8 detection confidence threshold (default: 0.35)')
     
     # Export & benchmark
     parser.add_argument('--export_onnx', action='store_true',
@@ -74,6 +78,83 @@ def parse_args():
     return parser.parse_args()
 
 
+# =============================================================================
+# VEHICLE SUPPRESSION (YOLOv8-nano)
+# =============================================================================
+
+class VehicleSuppressor:
+    """Detects vehicles and pedestrians using YOLOv8n and returns a suppression
+    mask to zero-out falsely-drivable pixels occupied by dynamic obstacles.
+
+    COCO classes suppressed:
+        0  — person
+        2  — car
+        3  — motorcycle
+        5  — bus
+        7  — truck
+
+    Uses YOLOv8n (nano, ~3MB). Auto-downloads weights on first run.
+    Typical latency: 3-6ms on RTX 4060 — negligible FPS impact.
+    """
+
+    # COCO class IDs to suppress
+    SUPPRESS_CLASSES = {0, 2, 3, 5, 7}  # person, car, motorcycle, bus, truck
+
+    def __init__(self, conf=0.35, device='cuda'):
+        """Load YOLOv8n. Weights auto-downloaded (~3MB) if not present.
+
+        Args:
+            conf:   Confidence threshold. 0.35 catches occluded vehicles
+                    without falsely suppressing road markings.
+            device: 'cuda' or 'cpu'
+        """
+        try:
+            from ultralytics import YOLO
+        except ImportError:
+            raise ImportError(
+                "ultralytics not installed. Run: pip install ultralytics"
+            )
+        self.conf = conf
+        self.device = device
+        self.yolo = YOLO('yolov8n.pt')
+        print(f"VehicleSuppressor loaded (YOLOv8n, conf={conf})")
+
+    def get_suppression_mask(self, image_bgr):
+        """Detect obstacles and return a binary suppression mask.
+
+        Args:
+            image_bgr: Original BGR image (any resolution).
+
+        Returns:
+            suppression_mask: uint8 array (H, W), 1 where vehicles are,
+                              0 elsewhere. Same spatial size as image_bgr.
+        """
+        H, W = image_bgr.shape[:2]
+        suppression_mask = np.zeros((H, W), dtype=np.uint8)
+
+        results = self.yolo(
+            image_bgr,
+            conf=self.conf,
+            device=self.device,
+            verbose=False,
+        )[0]
+
+        if results.boxes is None or len(results.boxes) == 0:
+            return suppression_mask
+
+        for box in results.boxes:
+            cls_id = int(box.cls.item())
+            if cls_id not in self.SUPPRESS_CLASSES:
+                continue
+            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+            # Clamp to image bounds
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(W, x2), min(H, y2)
+            suppression_mask[y1:y2, x1:x2] = 1
+
+        return suppression_mask
+
+
 class LiteSegInference:
     """Standalone inference class for LiteSeg model.
     
@@ -82,7 +163,8 @@ class LiteSegInference:
     """
     
     def __init__(self, weights_path, device=None, img_height=256, img_width=448,
-                 is_teacher=False, threshold=0.5):
+                 is_teacher=False, threshold=0.5,
+                 suppress_vehicles=False, yolo_conf=0.35):
         """Initialize inference pipeline.
         
         Args:
@@ -92,6 +174,8 @@ class LiteSegInference:
             img_width: Input width for the model.
             is_teacher: Whether to use teacher model.
             threshold: Binary threshold for mask.
+            suppress_vehicles: If True, use YOLOv8n to erase vehicles from mask.
+            yolo_conf: Detection confidence for YOLOv8n.
         """
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.img_height = img_height
@@ -114,8 +198,16 @@ class LiteSegInference:
         self.mean = np.array(data_stats.get('mean', [0.485, 0.456, 0.406]))
         self.std = np.array(data_stats.get('std', [0.229, 0.224, 0.225]))
         
+        # Optional vehicle suppressor
+        self.suppressor = None
+        if suppress_vehicles:
+            device_str = 'cuda' if torch.cuda.is_available() else 'cpu'
+            self.suppressor = VehicleSuppressor(conf=yolo_conf, device=device_str)
+        
         print(f"Model loaded on {self.device}")
         print(f"Parameters: {sum(p.numel() for p in self.model.parameters()):,}")
+        if self.suppressor:
+            print("Vehicle suppression: ENABLED (YOLOv8n)")
     
     def preprocess(self, image):
         """Preprocess a single image for inference.
@@ -178,6 +270,11 @@ class LiteSegInference:
                            interpolation=cv2.INTER_NEAREST)
         prob_map = cv2.resize(prob_map, (self.original_size[1], self.original_size[0]),
                              interpolation=cv2.INTER_LINEAR)
+        
+        # Suppress vehicles/pedestrians from the drivable mask
+        if self.suppressor is not None:
+            suppression_mask = self.suppressor.get_suppression_mask(image)
+            binary[suppression_mask > 0] = 0
         
         return binary, prob_map
     
@@ -382,7 +479,8 @@ def benchmark_pytorch(model, device, img_height=256, img_width=448, n_runs=200):
 
 def generate_demo_video(weights_path, dataroot, output_path='demo_video.mp4',
                         scene_name=None, img_height=256, img_width=448,
-                        is_teacher=False, fps=5):
+                        is_teacher=False, fps=5,
+                        suppress_vehicles=False, yolo_conf=0.35):
     """Generate a demo video with segmentation overlay on a scene sequence.
     
     Args:
@@ -394,6 +492,8 @@ def generate_demo_video(weights_path, dataroot, output_path='demo_video.mp4',
         img_width: Model input width.
         is_teacher: Use teacher model.
         fps: Video frame rate.
+        suppress_vehicles: Erase vehicles from drivable mask using YOLOv8n.
+        yolo_conf: Detection confidence for YOLOv8n.
     """
     import json
     
@@ -402,7 +502,9 @@ def generate_demo_video(weights_path, dataroot, output_path='demo_video.mp4',
     # Initialize inference
     inferencer = LiteSegInference(
         weights_path, img_height=img_height, img_width=img_width,
-        is_teacher=is_teacher
+        is_teacher=is_teacher,
+        suppress_vehicles=suppress_vehicles,
+        yolo_conf=yolo_conf,
     )
     
     # Load scene data
@@ -514,7 +616,9 @@ def main():
         
         inferencer = LiteSegInference(
             args.weights, img_height=args.img_height, img_width=args.img_width,
-            is_teacher=args.teacher, threshold=args.threshold
+            is_teacher=args.teacher, threshold=args.threshold,
+            suppress_vehicles=args.suppress_vehicles,
+            yolo_conf=args.yolo_conf,
         )
         
         binary, overlay, fps = inferencer.predict_and_visualize(
@@ -601,7 +705,9 @@ def main():
             args.weights, args.dataroot, video_path,
             scene_name=args.scene_name,
             img_height=args.img_height, img_width=args.img_width,
-            is_teacher=args.teacher
+            is_teacher=args.teacher,
+            suppress_vehicles=args.suppress_vehicles,
+            yolo_conf=args.yolo_conf,
         )
 
 
