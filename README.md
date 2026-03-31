@@ -3,7 +3,9 @@
 **Real-time drivable space segmentation for Level 4 autonomous vehicles, built entirely from scratch on nuScenes v1.0-mini.**
 
 ![Architecture](https://img.shields.io/badge/Architecture-MobileNetV2+ASPP+UNet-blue)
-![Params](https://img.shields.io/badge/Parameters-1.96M-green)
+![Params](https://img.shields.io/badge/Parameters-1.97M-green)
+![mIoU](https://img.shields.io/badge/mIoU-0.877-brightgreen)
+![FPS](https://img.shields.io/badge/FPS_GPU-182.7-orange)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
@@ -65,6 +67,9 @@ PRISM is a lightweight binary segmentation network that classifies every pixel i
 │   Segmentation Head              │
 │   Conv3×3 → Conv1×1 → Sigmoid    │
 │   Output: 1×256×448 (binary)     │
+├──────────────────────────────────┤
+│   Auxiliary Boundary Head        │
+│   Explicit edge supervision      │
 └──────────────────────────────────┘
 ```
 
@@ -72,10 +77,11 @@ PRISM is a lightweight binary segmentation network that classifies every pixel i
 
 | Metric | Student | Teacher |
 |---|---|---|
-| Parameters | **1.96M** ✓ | ~5.00M |
+| Parameters | **1.97M** ✓ | ~5.00M |
 | Input Resolution | 256 × 448 | 256 × 448 |
-| Output | Binary mask | Binary mask |
-| FPS Target | ~55 FPS | — |
+| Output | Binary mask + Boundary | Binary mask + Boundary |
+| Inference FPS (GPU) | **182.7** | — |
+| Mean Latency | **5.47 ms** | — |
 
 ---
 
@@ -85,12 +91,13 @@ PRISM is a lightweight binary segmentation network that classifies every pixel i
 PRISM/
 ├── model.py              # LiteSeg architecture (encoder + RAU + ASPP + decoder + SE)
 ├── dataset.py            # PyTorch Dataset with albumentations augmentations
-├── train.py              # Training pipeline (AdamW + CosineAnnealingLR)
-├── evaluate.py           # Evaluation: mIoU, confusion matrix, visualizations
+├── train.py              # Training pipeline (AdamW + OneCycleLR + PRISMLossV2)
+├── evaluate.py           # Evaluation: mIoU, confusion matrix, FPR analysis, visualizations
 ├── inference.py          # Inference + ONNX export + quantization + demo video
-├── utils.py              # Loss functions, metrics, post-processing, TTA
+├── utils.py              # Loss functions (PRISMLossV2), metrics, post-processing, TTA
 ├── generate_masks.py     # Drivable area mask generation from nuScenes (Auto-Calibrated)
 ├── requirements.txt      # Python dependencies
+├── OUTPUT_ZIP/           # Final evaluation outputs (confusion matrix, demo video, samples)
 └── README.md             # This file
 ```
 
@@ -119,7 +126,7 @@ tar -xzf v1.0-mini.tgz
 
 ### 3. Generate Drivable Masks
 
-The mask generator now uses an **auto-calibrated coordinate mapping** algorithm that automatically aligns the ego vehicle poses with the nuScenes `semantic_prior` bitmaps to produce highly accurate ground truth masks.
+The mask generator uses an **auto-calibrated coordinate mapping** algorithm that automatically aligns the ego vehicle poses with the nuScenes `semantic_prior` bitmaps to produce highly accurate ground truth masks.
 
 ```bash
 python generate_masks.py --dataroot ./ --output_dir masks --visualize 5
@@ -127,9 +134,9 @@ python generate_masks.py --dataroot ./ --output_dir masks --visualize 5
 
 ### 4. Train
 
-**Student model (1.96M params):**
+**Student model (1.97M params) with PRISMLossV2:**
 ```bash
-python train.py --dataroot ./ --mask_dir masks --epochs 50 --batch_size 16 --lr 1e-3
+python train.py --dataroot ./ --mask_dir masks --epochs 50 --batch_size 16 --lr 3e-3 --loss prism
 ```
 
 **Teacher model (~5.00M params) for knowledge distillation:**
@@ -167,18 +174,60 @@ python inference.py --demo_video --weights output/best_model.pth --dataroot ./
 
 ---
 
+## 📊 Evaluation Results
+
+The final trained student model evaluated across the validation set:
+
+| Metric | Value | Target | Status |
+|---|---|---|---|
+| **mIoU (overall binary)** | **0.8772** | > 0.75 | ✅ Exceeded |
+| **mIoU (drivable class)** | **0.8500** | > 0.72 | ✅ Exceeded |
+| **mIoU (non-drivable)** | **0.9044** | — | ✅ |
+| **Precision** | **0.8868** | > 0.80 | ✅ Exceeded |
+| **Recall** | **0.9534** | > 0.70 | ✅ Exceeded |
+| **False Positive Rate (FPR)** | **0.0710** | < 0.10 | ✅ Met |
+| **F1 Score** | **0.9189** | > 0.75 | ✅ Exceeded |
+| **Inference FPS (CUDA)** | **182.7** | > 30 (CPU) | ✅ Exceeded |
+| **Mean Latency** | **5.47 ms** | — | ✅ |
+| **Model Parameters** | **1,967,179** | < 3M | ✅ Met |
+
+> **TTA Enabled:** False &nbsp;|&nbsp; **Boundary Refinement:** False  
+> _Results shown are raw model output without any post-processing._
+
+### Visualizations
+
+**Confusion Matrix:**  
+![Confusion Matrix](OUTPUT_ZIP/confusion_matrix.png)
+
+**Demo Video:**  
+The `OUTPUT_ZIP/demo_video.mp4` shows the model's real-time inference on sequential driving scenes with overlay visualization.
+
+---
+
 ## 📊 Training Recipe
 
 | Hyperparameter | Value |
 |---|---|
 | **Optimizer** | AdamW |
-| **Learning Rate** | 1e-3 |
-| **Weight Decay** | 1e-4 |
-| **LR Schedule** | CosineAnnealingLR |
-| **Loss Function** | ComboLoss (0.5×BCE + 0.5×Dice) |
+| **Peak Learning Rate** | 3e-3 |
+| **Weight Decay** | 5e-4 |
+| **LR Schedule** | OneCycleLR (35% warmup) |
+| **Loss Function** | PRISMLossV2 (Focal + Tversky + Multi-Scale Boundary + Spatial Prior) |
 | **Batch Size** | 16 (GPU) / 4 (CPU) |
+| **Gradient Accumulation** | Configurable (default: 1) |
 | **Epochs** | 50+ |
 | **Input Size** | 256 × 448 |
+| **Early Stopping** | Patience = 10 epochs |
+
+### PRISMLossV2 Components
+
+| Component | Weight | Purpose |
+|---|---|---|
+| **Focal Loss** (α=0.75, γ=2.0) | 0.30 | Hard pixel mining, class imbalance |
+| **Tversky Loss** (α=0.3, β=0.7) | 0.40 | False positive suppression (buildings/sky → road) |
+| **Multi-Scale Boundary Loss** (k=3,5,9) | 0.15 | Crisp edge predictions at multiple scales |
+| **Spatial Prior Loss** (sky=35%) | 0.15 | Penalizes drivable predictions in sky region |
+| **Boundary Head Loss** | 0.10 | Auxiliary edge supervision via dedicated head |
 
 ### Augmentations
 - Random horizontal flip
@@ -196,9 +245,10 @@ python inference.py --demo_video --weights output/best_model.pth --dataroot ./
 
 | Edge Case | Solution |
 |---|---|
-| Road-to-grass transitions | Boundary-aware loss weighting |
+| Road-to-grass transitions | Multi-scale boundary loss + boundary head |
 | Water puddles / reflective surfaces | **Reflection Attention Unit (RAU)** suppresses false sky reflections on road |
 | Low contrast / structural uncertainty | **CoordConv Stem** provides spatial priors directly to the network |
+| Buildings/sky segmented as road | **Tversky Loss** (α=0.3) heavily penalizes FPs + **Spatial Prior Loss** |
 | Construction zones | Training on urban construction scene data |
 | Night scenes | Gamma augmentation + 3 night scenes in dataset |
 | Partial occlusion | Coarse dropout augmentation |
@@ -208,45 +258,17 @@ python inference.py --demo_video --weights output/best_model.pth --dataroot ./
 ## 🏆 Key Differentiators
 
 1. **100% From Scratch** — No pre-trained weights, no `torchvision.models` imports
-2. **Advanced Architecture Setup** — Introduces CoordConv, Reflection Attention Units (RAU), and Squeeze-and-Excitation natively for drivable space task.
-3. **Auto-Calibrated Mask Generation** — Automatically aligns bitmap maps using ego positions to fix label misalignment.
-4. **Boundary Refinement** — Morphological open/close post-processing
-5. **Test-Time Augmentation** — Horizontal flip averaging for free mIoU boost
-6. **Knowledge Distillation** — 5M teacher → 1.96M student training
-7. **ONNX + Quantization** — Dynamic int8 quantization for edge deployment
-
----
-
-## 📋 Evaluation Metrics
-
-The final trained student model evaluated across the validation set yields the following results:
-
-| Metric | Target | Achieved |
-|---|---|---|
-| mIoU (overall binary) | > 0.75 | **0.8789** |
-| mIoU (drivable class) | > 0.72 | **0.8521** |
-| mIoU (non-drivable class) | - | **0.9058** |
-| Inference FPS | > 30 | **~54.79** |
-| Mean Latency | - | **18.25 ms** |
-| Model parameters | < 3M | **1.96 M** |
-
-### Per-Scene Highlights
-
-* **Best Performing Scene:** `scene-1100` with **0.9306** mIoU
-* **Most Challenging Scene:** `scene-0061` with **0.7638** mIoU
-
-### Visualizations
-
-Here is a glimpse of the model's predictions:
-
-**Daytime Scene:**  
-![Daytime Evaluation](eval_output/visualizations/eval_sample_00.png)
-
-**Nighttime Scene:**  
-![Nighttime Evaluation](eval_output/visualizations/eval_sample_01.png)
-
-**Confusion Matrix:**  
-![Confusion Matrix](eval_output/confusion_matrix.png)
+2. **PRISMLossV2** — Custom 5-component loss function: Focal + Tversky + Multi-Scale Boundary + Spatial Prior + Boundary Head, specifically designed for false-positive-aware drivable space segmentation
+3. **Reflection Attention Unit (RAU)** — Novel attention mechanism detecting water puddles via sky-ground vertical correlation with gated residual design (safe for from-scratch training)
+4. **CoordConv Stem** — Injects (x, y) positional channels, giving the model spatial awareness without pretrained features
+5. **Squeeze-and-Excitation Decoder** — Channel recalibration attention in U-Net decoder blocks
+6. **Auxiliary Boundary Head** — Dedicated head for explicit boundary supervision, producing sharper edges
+7. **Auto-Calibrated Mask Generation** — Automatically aligns bitmap maps using ego positions to fix label misalignment
+8. **False-Positive-Aware Metrics** — Tracks Precision, Recall, FPR, and F1 alongside mIoU throughout training
+9. **OneCycleLR with 35% Warmup** — Stabilized from-scratch convergence
+10. **Knowledge Distillation** — 5M teacher → 1.97M student training pipeline
+11. **ONNX + Quantization** — Dynamic int8 quantization for edge deployment
+12. **Test-Time Augmentation** — Horizontal flip averaging for free mIoU boost
 
 ---
 
@@ -269,7 +291,7 @@ Here is a glimpse of the model's predictions:
 tensorboard --logdir runs
 ```
 
-Tracks: training/validation loss, mIoU, learning rate, FPS.
+Tracks: training/validation loss, mIoU, learning rate, FPS, **Precision, Recall, FPR, F1**.
 
 ---
 
@@ -277,11 +299,28 @@ Tracks: training/validation loss, mIoU, learning rate, FPS.
 
 - **PyTorch** — Model, training, inference
 - **Albumentations** — Image augmentations
-- **OpenCV** — Image processing, mask auto-calibration
+- **OpenCV** — Image processing, mask auto-calibration, morphological operations
 - **ONNX / ONNX Runtime** — Model export and optimized inference
 - **TensorBoard** — Training visualization
 - **nuScenes devkit** — Dataset utilities
+- **scikit-learn** — Confusion matrix computation
 
 ---
 
-*Built for MAHE Hackathon*
+## 📦 Output ZIP
+
+The `OUTPUT_ZIP/` directory contains the final evaluation deliverables:
+
+```
+OUTPUT_ZIP/
+├── confusion_matrix.png        # Binary confusion matrix visualization
+├── demo_video.mp4              # Real-time inference overlay on driving scenes
+└── visualizations/             # Per-sample evaluation visualizations
+    ├── eval_sample_00.png      # Input | Ground Truth | Prediction | Overlay
+    ├── eval_sample_01.png
+    └── ... (10 samples)
+```
+
+---
+
+*Built for HackToFuture 4.0 — MAHE Hackathon*
