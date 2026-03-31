@@ -196,6 +196,12 @@ The final trained student model evaluated across the validation set:
 
 ### Visualizations
 
+**Daytime Scene** (mIoU: 0.844):  
+![Daytime Evaluation](OUTPUT_ZIP/visualizations/eval_sample_00.png)
+
+**Nighttime Scene** (mIoU: 0.951):  
+![Nighttime Evaluation](OUTPUT_ZIP/visualizations/eval_sample_07.png)
+
 **Confusion Matrix:**  
 ![Confusion Matrix](OUTPUT_ZIP/confusion_matrix.png)
 
